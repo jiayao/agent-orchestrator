@@ -1,4 +1,0 @@
-{"ts":"2026-09-15T21:31:25.860Z","kind":"decision","task_id":"t-20260915213044-140680","action":"accept","event_ids":["evt_0009"],"rationale":"clearest convergence"}
-{"ts":"2026-09-15T21:31:25.920Z","kind":"verdict","task_id":"t-20260915213044-140680","verdict":"good","note":"decision held up"}
-{"ts":"2026-09-15T21:32:29.629Z","kind":"decision","task_id":"t-20260915213226-e3b9ed","action":"accept","event_ids":["evt_0004"],"rationale":null}
-{"ts":"2026-09-15T21:32:29.693Z","kind":"verdict","task_id":"t-20260915213226-e3b9ed","verdict":"good","note":"mock verdict"}
