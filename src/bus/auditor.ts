@@ -2,8 +2,13 @@
 // Commits two record kinds to the blackboard: bus_raw (everything the relay
 // served) and turn (passing the deterministic validation rule). Only accepted
 // turns drive budgets, history, and end reasons. The auditor owns the idle
-// deadline and imposes termination: no accepted turn within idle_timeout ->
-// it publishes chat_ended{idle_timeout} and commits it. Termination is
+// deadline and imposes termination. Two regimes: before the first accepted
+// turn lands, a long pre-first-turn deadline applies (default 1h) and firing
+// it ends the chat as idle_before_first_turn — the idle clock must not start
+// on a chat that never began. After the first accepted turn, the regular
+// idle_timeout (default 120s) applies, anchored on the last accepted turn.
+// On restart the regime is re-derived from already-committed turns, so a
+// restarted auditor never re-enters the pre-first-turn regime on a live chat.
 // auditor-imposed — the log says so.
 //
 // Crash discipline: the cursor is derived as max committed relay seq in
@@ -41,7 +46,8 @@ export interface BusChatContext {
 }
 
 export interface BusAuditorOptions {
-  idleTimeoutMs?: number; // default 120s
+  idleTimeoutMs?: number; // default 120s; applies after the first accepted turn
+  preFirstTurnTimeoutMs?: number; // default 1h; applies before the first accepted turn
   maxTurns?: number; // substantive cap -> chat_ended{expired}
   pollWaitMs?: number; // per-request long-poll wait, default 1s
   signal?: AbortSignal;
@@ -59,6 +65,7 @@ export async function runBusAuditor(
   opts: BusAuditorOptions = {}
 ): Promise<ChatSummary> {
   const idleTimeoutMs = opts.idleTimeoutMs ?? 120_000;
+  const preFirstTurnTimeoutMs = opts.preFirstTurnTimeoutMs ?? 3_600_000;
   const maxTurns = opts.maxTurns ?? meta.chat?.max_turns ?? config.chat.max_turns;
   const pollWaitMs = opts.pollWaitMs ?? 1_000;
 
@@ -100,10 +107,16 @@ export async function runBusAuditor(
   let totalTurns = committedTurns.length;
   let substantive = committedTurns.filter((t) => t.signal !== "pass").length;
   const acceptedSignals = committedTurns.map((t) => t.signal ?? "continue");
-  // Idle clock: anchored on the last committed accepted turn, else now.
+  // Idle clock: two regimes. The post-first-turn clock anchors on the last
+  // committed accepted turn; the pre-first-turn clock anchors on auditor
+  // start. hasAcceptedTurn is re-derived from already-committed turns so a
+  // restarted auditor (resume / adopt) never re-enters the pre-first-turn
+  // regime on a live chat.
+  const bootAt = Date.now();
+  let hasAcceptedTurn = committedTurns.length > 0;
   let lastAcceptedAt = committedTurns.length
     ? Date.parse(committedTurns[committedTurns.length - 1].ts)
-    : Date.now();
+    : bootAt;
 
   meta.state = "running";
   bb.writeMeta(meta);
@@ -257,6 +270,19 @@ export async function runBusAuditor(
       totalTurns += 1;
       if (sig !== "pass") substantive += 1;
       lastAcceptedAt = Date.now();
+      if (!hasAcceptedTurn) {
+        // First accepted turn: the pre-first-turn regime ends and the
+        // regular idle clock arms. Emit the flip so operators watching the
+        // event log can see which deadline is in force.
+        hasAcceptedTurn = true;
+        await emit({
+          actor: "orchestrator",
+          type: "note",
+          round: 0,
+          reply_to: null,
+          body: `first accepted turn committed; post-first-turn idle timer armed (${idleTimeoutMs}ms)`,
+        });
+      }
       meta.chat!.substantive_turns = substantive;
       meta.chat!.total_turns = totalTurns;
       bb.writeMeta(meta);
@@ -358,9 +384,19 @@ export async function runBusAuditor(
     for (;;) {
       if (opts.signal?.aborted) break;
 
-      const idleLeft = idleTimeoutMs - (Date.now() - lastAcceptedAt);
-      if (idleLeft <= 0) {
-        return await endChat("idle_timeout", `no accepted turn within ${idleTimeoutMs}ms`);
+      // Two-regime idle check: before the first accepted turn the long
+      // pre-first-turn deadline applies (a chat that never began must not
+      // be killed on the 120s clock); after it, the regular idle clock.
+      const deadlineLeft = hasAcceptedTurn
+        ? idleTimeoutMs - (Date.now() - lastAcceptedAt)
+        : preFirstTurnTimeoutMs - (Date.now() - bootAt);
+      if (deadlineLeft <= 0) {
+        return hasAcceptedTurn
+          ? await endChat("idle_timeout", `no accepted turn within ${idleTimeoutMs}ms`)
+          : await endChat(
+              "idle_before_first_turn",
+              `no accepted turn within ${preFirstTurnTimeoutMs}ms of auditor start`
+            );
       }
 
       // If the opening control hasn't been observed yet (e.g. the relay lost
@@ -373,7 +409,7 @@ export async function runBusAuditor(
 
       let batch: RelayMessage[];
       try {
-        const res = await client.poll(cursor, Math.max(1, Math.min(pollWaitMs, idleLeft)));
+        const res = await client.poll(cursor, Math.max(1, Math.min(pollWaitMs, deadlineLeft)));
         batch = res.messages;
       } catch (e) {
         const status = (e as BusError).status;
