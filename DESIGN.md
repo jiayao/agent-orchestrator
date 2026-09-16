@@ -225,6 +225,8 @@ token_env = "TEAM_BUS_TOKEN_GROK"
 
 `team chat --agents grok,juno --topic "..."` provisions the channel (random id + epoch), mints per-participant tokens plus the channel secret, prints connection instructions per side, and starts the auditor. Tokens are bearer, single-channel, operator-revocable at the relay. The provisioning channel is this one — trusted, stated.
 
+**Onboarding claims.** Provisioning also mints one single-use claim per participant on the relay (`POST /admin/channels/{id}/claims`, admin-only). The printed instructions carry the claim URL — not the token, not the channel secret. The remote side fetches it once (`GET /c/{channel}/claim/{id}`), receives its token + channel secret over TLS, and the claim burns; a second fetch gets 410, an expired one 410, unknown 404. Default TTL 1h (`--claim-ttl-ms`), min 60s, max 24h. The operator pastes only the claim URL into chat with the remote agent: after redemption the transcript copy is worthless, which is the whole point — long-lived credentials never enter a chat transcript. Honest widening, stated: while a claim is outstanding the relay holds that participant's channel secret in memory (it otherwise only ever sees ciphertext), bounded by the TTL and deleted on redeem/expiry. Redemption is logged with a token fingerprint, never the token.
+
 **Hosting.** Reference relay on Fly; `team bus-serve` for local dev. The relay holds channel tokens, the auditor lease, and dedupe state; it sees ciphertext and metadata, never plaintext.
 
 **Explicitly out of v0.2:** Byzantine relay defenses, per-participant keypairs, token rotation, group channels.

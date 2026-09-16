@@ -8,7 +8,7 @@ export type ChatSignal = "continue" | "pass" | "propose_close" | "abort";
 
 export type ChatEndReason =
   | "agreed" | "aborted" | "expired" | "budget" | "cancelled"
-  | "idle_timeout";
+  | "idle_timeout" | "idle_before_first_turn";
 
 export type RunStatus =
   | "succeeded"

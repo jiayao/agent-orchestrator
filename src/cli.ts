@@ -81,7 +81,7 @@ commands:
       [--max-turns N] [--history-budget chars] [--console-timeout ms]
       bus agents: provisions a channel on the relay, prints per-side
       connection instructions, starts the auditor
-      [--idle-timeout ms] [--bus-admin-token T | env TEAM_BUS_ADMIN_TOKEN]
+      [--idle-timeout ms] [--claim-ttl-ms ms] [--bus-admin-token T | env TEAM_BUS_ADMIN_TOKEN]
   chat --resume <task-id>             continue a cancelled/interrupted chat
   bus-serve [--port 8787]             local dev relay (in-memory; prod = Fly)
       [--admin-token T | env TEAM_BUS_ADMIN_TOKEN]
@@ -593,7 +593,9 @@ async function cmdChat(args: ParsedArgs): Promise<void> {
       if (!adminToken) {
         fail("bus provisioning needs the relay admin token (--bus-admin-token or TEAM_BUS_ADMIN_TOKEN)");
       }
-      const prov = await provisionBusChat(busUrl, adminToken, [agents[0], agents[1]]);
+      const prov = await provisionBusChat(busUrl, adminToken, [agents[0], agents[1]], {
+        claimTtlMs: numFlag(args.flags.get("claim-ttl-ms")),
+      });
       meta.chat.bus = {
         bus_url: busUrl,
         channel: prov.channel,

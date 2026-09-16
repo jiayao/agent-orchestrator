@@ -10,7 +10,7 @@ import { join } from "node:path";
 import type { Blackboard } from "../blackboard.ts";
 import type { AgentConfig, TaskMeta, TeamConfig } from "../types.ts";
 import type { ChatSummary } from "../chat.ts";
-import { adminProvisionChannel, BusClient } from "./client.ts";
+import { adminMintClaim, adminProvisionChannel, BusClient, fetchClaim, type ClaimBundle } from "./client.ts";
 import { newChannelSecret, newId, newToken } from "./crypto.ts";
 import { runBusAuditor, type BusAuditorOptions } from "./auditor.ts";
 
@@ -18,6 +18,12 @@ export interface BusSecrets {
   channel_secret: string;
   /** author -> bearer token */
   tokens: Record<string, string>;
+}
+
+export interface BusClaim {
+  claim_id: string;
+  claim_url: string;
+  expires_at: string;
 }
 
 export interface BusProvision {
@@ -28,6 +34,8 @@ export interface BusProvision {
   /** participant id -> bearer token (includes "orchestrator") */
   tokens: Record<string, string>;
   firstSpeaker: string;
+  /** participant id -> one-time onboarding claim (single-use, TTL-bounded) */
+  claims: Record<string, BusClaim>;
 }
 
 /** The file in the task dir holding channel secret + tokens (mode 0600). */
@@ -55,7 +63,8 @@ export function readBusSecrets(bb: Blackboard, taskId: string): BusSecrets {
 export async function provisionBusChat(
   busUrl: string,
   adminToken: string,
-  agents: [AgentConfig, AgentConfig]
+  agents: [AgentConfig, AgentConfig],
+  opts: { claimTtlMs?: number } = {}
 ): Promise<BusProvision> {
   const channel = newId("chat-");
   const epoch = newId("e-");
@@ -66,7 +75,47 @@ export async function provisionBusChat(
     orchestrator: newToken(),
   };
   await adminProvisionChannel(busUrl, adminToken, { channel, epoch, tokens });
-  return { busUrl, channel, epoch, secret, tokens, firstSpeaker: agents[0].id };
+  // One-time claim per participant: the operator hands the remote side the
+  // claim URL instead of pasting the long-lived token + channel secret into
+  // a chat transcript. Local sides keep using bus.secret.json.
+  const claims: Record<string, BusClaim> = {};
+  for (const agent of agents) {
+    const minted = await adminMintClaim(
+      busUrl,
+      adminToken,
+      channel,
+      agent.id,
+      secret,
+      opts.claimTtlMs ?? 3_600_000
+    );
+    claims[agent.id] = {
+      claim_id: minted.claim_id,
+      claim_url: `${busUrl.replace(/\/+$/, "")}/c/${channel}/claim/${minted.claim_id}`,
+      expires_at: minted.expires_at,
+    };
+  }
+  return { busUrl, channel, epoch, secret, tokens, firstSpeaker: agents[0].id, claims };
+}
+
+/**
+ * Fetch a one-time claim URL and normalize it into participant options.
+ * The caller should write the token + secret to a local 0600 file and
+ * never paste them into chat — the claim URL is the only thing that ever
+ * traveled through the chat transcript, and it is dead after this call.
+ */
+export async function claimBusSecrets(
+  claimUrl: string
+): Promise<{ busUrl: string; channel: string; epoch: string; participant: string; token: string; secret: string }> {
+  const bundle: ClaimBundle = await fetchClaim(claimUrl);
+  const busUrl = new URL(claimUrl).origin;
+  return {
+    busUrl,
+    channel: bundle.channel,
+    epoch: bundle.epoch,
+    participant: bundle.participant,
+    token: bundle.token,
+    secret: bundle.channel_secret,
+  };
 }
 
 /**
@@ -79,19 +128,27 @@ export function connectionInstructions(
   agent: AgentConfig,
   peerId: string
 ): string {
-  const token = prov.tokens[agent.id];
+  const claim = prov.claims[agent.id];
   return [
     `--- connection instructions for ${agent.id} ---`,
     `bus_url:    ${prov.busUrl}`,
     `channel:    ${prov.channel}`,
     `epoch:      ${prov.epoch}`,
     `peer:       ${peerId}`,
-    `export ${agent.token_env ?? "TEAM_BUS_TOKEN"}=${token}`,
-    `channel_secret: ${prov.secret}   (shared; decrypts every message on this channel)`,
+    ``,
+    `one-time claim URL (single-use, expires ${claim.expires_at}):`,
+    `  ${claim.claim_url}`,
+    `paste ONLY this URL into chat with the ${agent.id} side — never the token or channel secret.`,
+    `on the ${agent.id} machine, fetch it once and store the result in a 0600 file:`,
+    `  curl -s ${claim.claim_url}`,
+    `  -> {"participant","token","channel_secret","channel","epoch"}`,
+    `after this fetch the URL is dead; a leaked transcript copy is worthless.`,
+    ``,
+    `operator's local copy of all secrets: bus.secret.json in the task dir (0600).`,
     ``,
     `participant protocol:`,
     `  GET  ${prov.busUrl}/c/${prov.channel}/messages?since=<seq>&wait=<ms>`,
-    `       (Authorization: Bearer $${agent.token_env ?? "TEAM_BUS_TOKEN"}; long-poll subscribe)`,
+    `       (Authorization: Bearer <your token>; long-poll subscribe)`,
     `  POST ${prov.busUrl}/c/${prov.channel}/messages`,
     `       body {"msg_id","nonce","ct"} — payload AEAD-encrypted under channel_secret`,
     `       (AES-256-GCM, AAD = "<channel>:<msg_id>", nonce||ct base64)`,

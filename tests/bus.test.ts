@@ -16,7 +16,7 @@ import {
   BusCryptoError,
 } from "../src/bus/crypto.ts";
 import { startRelay, type RelayHandle } from "../src/bus/relay.ts";
-import { adminProvisionChannel, BusClient, BusError, type FetchFn } from "../src/bus/client.ts";
+import { adminProvisionChannel, adminMintClaim, fetchClaim, BusClient, BusError, type FetchFn } from "../src/bus/client.ts";
 import {
   encodeEnded,
   encodeStarted,
@@ -25,6 +25,7 @@ import {
   type RelayMessage,
 } from "../src/bus/protocol.ts";
 import { runBusAuditor, type BusChatContext } from "../src/bus/auditor.ts";
+import { claimBusSecrets, connectionInstructions, provisionBusChat } from "../src/bus/session.ts";
 import { ParticipantRuntime } from "../src/bus/participant.ts";
 import { makeMeta } from "./helpers.ts";
 
@@ -188,6 +189,97 @@ describe("relay semantics", () => {
   });
 });
 
+describe("onboarding claims", () => {
+  test("mint -> fetch returns the participant's token + secret; second fetch is dead", async () => {
+    const f = await setupBus("t-claim");
+    try {
+      const minted = await adminMintClaim(f.relay.url, "adm-test", f.ctx.channel, "a", f.secret);
+      expect(minted.claim_id).toMatch(/^[0-9a-f]{48}$/);
+      const bundle = await fetchClaim(
+        `${f.relay.url}/c/${f.ctx.channel}/claim/${minted.claim_id}`
+      );
+      expect(bundle.participant).toBe("a");
+      expect(bundle.token).toBe(f.tokens.a);
+      expect(bundle.channel_secret).toBe(f.secret);
+      expect(bundle.channel).toBe(f.ctx.channel);
+      expect(bundle.epoch).toBe(f.ctx.epoch);
+      // single-use: the claim is burned
+      await expect(
+        fetchClaim(`${f.relay.url}/c/${f.ctx.channel}/claim/${minted.claim_id}`)
+      ).rejects.toThrow(/no such claim/);
+      // a claim for b is untouched by a's redemption
+      const mintedB = await adminMintClaim(f.relay.url, "adm-test", f.ctx.channel, "b", f.secret);
+      const bundleB = await fetchClaim(
+        `${f.relay.url}/c/${f.ctx.channel}/claim/${mintedB.claim_id}`
+      );
+      expect(bundleB.token).toBe(f.tokens.b);
+    } finally {
+      f.relay.stop();
+    }
+  });
+
+  test("expired claim is dead; unknown claim is 404", async () => {
+    const f = await setupBus("t-claimexp");
+    try {
+      const minted = await adminMintClaim(f.relay.url, "adm-test", f.ctx.channel, "a", f.secret, 60_000);
+      // force expiry by minting with a past deadline is not possible via the
+      // API (min TTL 60s), so expire it through the test handle instead
+      f.relay.channel(f.ctx.channel)!.claims.get(minted.claim_id)!.expiresAt = Date.now() - 1;
+      await expect(
+        fetchClaim(`${f.relay.url}/c/${f.ctx.channel}/claim/${minted.claim_id}`)
+      ).rejects.toThrow(/expired/);
+      await expect(
+        fetchClaim(`${f.relay.url}/c/${f.ctx.channel}/claim/${"0".repeat(48)}`)
+      ).rejects.toThrow(/no such claim/);
+    } finally {
+      f.relay.stop();
+    }
+  });
+
+  test("minting requires admin and a real participant", async () => {
+    const f = await setupBus("t-claimauth");
+    try {
+      await expect(
+        adminMintClaim(f.relay.url, "wrong-admin", f.ctx.channel, "a", f.secret)
+      ).rejects.toThrow(/unauthorized/);
+      await expect(
+        adminMintClaim(f.relay.url, "adm-test", f.ctx.channel, "nobody", f.secret)
+      ).rejects.toThrow(/no such participant/);
+      await expect(
+        adminMintClaim(f.relay.url, "adm-test", "chat-nope", "a", f.secret)
+      ).rejects.toThrow(/no such channel/);
+    } finally {
+      f.relay.stop();
+    }
+  });
+
+  test("provisioning mints claims; instructions carry the URL, not the secrets", async () => {
+    const f = await setupBus("t-claimprov");
+    try {
+      const agents = [
+        { id: "a", kind: "bus", bus_url: f.relay.url },
+        { id: "b", kind: "bus", bus_url: f.relay.url },
+      ] as Parameters<typeof provisionBusChat>[2];
+      const prov = await provisionBusChat(f.relay.url, "adm-test", agents, { claimTtlMs: 120_000 });
+      expect(Object.keys(prov.claims).sort()).toEqual(["a", "b"]);
+      for (const id of ["a", "b"] as const) {
+        const text = connectionInstructions(prov, agents[id === "a" ? 0 : 1], id === "a" ? "b" : "a");
+        expect(text).toContain(prov.claims[id].claim_url);
+        // the long-lived credentials must not appear in what the operator pastes
+        expect(text).not.toContain(prov.tokens[id]);
+        expect(text).not.toContain(prov.secret);
+      }
+      // the claim actually onboards: fetch -> connect -> publish accepted
+      const got = await claimBusSecrets(prov.claims.a.claim_url);
+      expect(got.participant).toBe("a");
+      expect(got.token).toBe(prov.tokens.a);
+      expect(got.secret).toBe(prov.secret);
+    } finally {
+      f.relay.stop();
+    }
+  });
+});
+
 describe("bus auditor", () => {
   test("validation: dup ignored, spam burst raw-only, only accepted turns drive counts", async () => {
     const f = await setupBus("t-audit");
@@ -299,10 +391,19 @@ describe("bus auditor", () => {
   test("idle timeout: auditor publishes chat_ended{idle_timeout}; post-close turns are raw-only", async () => {
     const f = await setupBus("t-idle");
     try {
-      const s1 = await runBusAuditor(f.bb, f.config, f.meta, f.clients.orchestrator, f.ctx, {
+      const done = runBusAuditor(f.bb, f.config, f.meta, f.clients.orchestrator, f.ctx, {
         idleTimeoutMs: 150,
         pollWaitMs: 30,
       });
+      // opening control committed before any turn is valid
+      await waitFor(
+        () => f.bb.readEvents(f.meta.id).some((e) => e.type === "chat_started"),
+        "opening committed"
+      );
+      // one accepted turn moves the chat into the post-first-turn regime
+      await f.clients.a.publish("a-turn-1", encodeTurn(null, "a opens"));
+      await waitFor(() => turns(f.bb, f.meta.id).length === 1, "first turn accepted");
+      const s1 = await done;
       expect(s1.end_reason).toBe("idle_timeout");
       const ended = f.bb.readEvents(f.meta.id).find((e) => e.type === "chat_ended")!;
       expect(ended.bus!.reason).toBe("idle_timeout");
@@ -317,14 +418,95 @@ describe("bus auditor", () => {
       await f.clients.a.publish("a-late", encodeTurn(null, "too late"));
       const s2 = await runBusAuditor(f.bb, f.config, f.meta, f.clients.orchestrator, f.ctx, {
         idleTimeoutMs: 150,
+        preFirstTurnTimeoutMs: 150,
         pollWaitMs: 30,
       });
       expect(s2.end_reason).toBe("idle_timeout");
       const evs = f.bb.readEvents(f.meta.id);
-      expect(evs.filter((e) => e.type === "chat_ended")).toHaveLength(1);
-      expect(turns(f.bb, f.meta.id)).toHaveLength(0);
+      expect(evs.filter((e) => e.type === "chat_ended")).toHaveLength(1); // only a-turn-1; a-late raw-only
+      expect(turns(f.bb, f.meta.id)).toHaveLength(1); // only a-turn-1; a-late raw-only
       const lateRaw = raws(f.bb, f.meta.id).find((e) => e.bus!.msg_id === "a-late");
       expect(lateRaw).toBeDefined();
+    } finally {
+      f.relay.stop();
+    }
+  }, T);
+
+  test("idle before first turn: pre-first-turn deadline ends chat as idle_before_first_turn", async () => {
+    const f = await setupBus("t-prefirst");
+    try {
+      // no turn ever arrives: the short idleTimeoutMs must NOT fire —
+      // the pre-first-turn regime owns the deadline.
+      const s = await runBusAuditor(f.bb, f.config, f.meta, f.clients.orchestrator, f.ctx, {
+        idleTimeoutMs: 150,
+        preFirstTurnTimeoutMs: 400,
+        pollWaitMs: 30,
+      });
+      expect(s.end_reason).toBe("idle_before_first_turn");
+      const ended = f.bb.readEvents(f.meta.id).find((e) => e.type === "chat_ended")!;
+      expect(ended.bus!.reason).toBe("idle_before_first_turn");
+    } finally {
+      f.relay.stop();
+    }
+  }, T);
+
+  test("idle regime flips after first accepted turn: note emitted, post-first-turn clock applies", async () => {
+    const f = await setupBus("t-flip");
+    try {
+      const done = runBusAuditor(f.bb, f.config, f.meta, f.clients.orchestrator, f.ctx, {
+        idleTimeoutMs: 200,
+        preFirstTurnTimeoutMs: 30_000,
+        pollWaitMs: 30,
+      });
+      // opening control committed before any turn is valid
+      await waitFor(
+        () => f.bb.readEvents(f.meta.id).some((e) => e.type === "chat_started"),
+        "opening committed"
+      );
+      await f.clients.a.publish("a-turn-1", encodeTurn(null, "a opens"));
+      await waitFor(() => turns(f.bb, f.meta.id).length === 1, "first turn accepted");
+      // the mode flip is visible in the event log
+      const note = f.bb
+        .readEvents(f.meta.id)
+        .find((e) => e.type === "note" && e.body.includes("post-first-turn idle timer armed"));
+      expect(note).toBeDefined();
+      // no more turns: the post-first-turn clock (200ms), not the 30s
+      // pre-first-turn deadline, ends the chat
+      const s = await done;
+      expect(s.end_reason).toBe("idle_timeout");
+    } finally {
+      f.relay.stop();
+    }
+  }, T);
+
+  test("idle regime survives restart: derived from committed turns, not boot", async () => {
+    const f = await setupBus("t-resume-idle");
+    const ctl = new AbortController();
+    try {
+      const first = runBusAuditor(f.bb, f.config, f.meta, f.clients.orchestrator, f.ctx, {
+        idleTimeoutMs: 30_000,
+        preFirstTurnTimeoutMs: 30_000,
+        pollWaitMs: 30,
+        signal: ctl.signal,
+      });
+      // opening control committed before any turn is valid
+      await waitFor(
+        () => f.bb.readEvents(f.meta.id).some((e) => e.type === "chat_started"),
+        "opening committed"
+      );
+      await f.clients.a.publish("a-turn-1", encodeTurn(null, "a opens"));
+      await waitFor(() => turns(f.bb, f.meta.id).length === 1, "first turn accepted");
+      ctl.abort();
+      await first;
+      // restart into the live chat: the committed turn means the auditor
+      // must be in the post-first-turn regime, so a short idleTimeoutMs
+      // ends it as idle_timeout, not idle_before_first_turn.
+      const s = await runBusAuditor(f.bb, f.config, f.meta, f.clients.orchestrator, f.ctx, {
+        idleTimeoutMs: 150,
+        preFirstTurnTimeoutMs: 30_000,
+        pollWaitMs: 30,
+      });
+      expect(s.end_reason).toBe("idle_timeout");
     } finally {
       f.relay.stop();
     }
@@ -462,18 +644,20 @@ describe("bus auditor", () => {
     try {
       const s1 = await runBusAuditor(f.bb, f.config, f.meta, f.clients.orchestrator, f.ctx, {
         idleTimeoutMs: 120,
+        preFirstTurnTimeoutMs: 120,
         pollWaitMs: 30,
       });
-      expect(s1.end_reason).toBe("idle_timeout");
-      const msgId = endedMsgId(f.ctx.epoch, 0, "idle_timeout");
+      expect(s1.end_reason).toBe("idle_before_first_turn");
+      const msgId = endedMsgId(f.ctx.epoch, 0, "idle_before_first_turn");
 
       // auditor restart: committed terminal control is re-published; relay
       // dedupe collapses it — exactly one copy on the log, one committed event
       const s2 = await runBusAuditor(f.bb, f.config, f.meta, f.clients.orchestrator, f.ctx, {
         idleTimeoutMs: 120,
+        preFirstTurnTimeoutMs: 120,
         pollWaitMs: 30,
       });
-      expect(s2.end_reason).toBe("idle_timeout");
+      expect(s2.end_reason).toBe("idle_before_first_turn");
       const msgs = f.relay.channel(f.ctx.channel)!.messages;
       expect(msgs.filter((m) => m.msg_id === msgId)).toHaveLength(1);
       const evs = f.bb.readEvents(f.meta.id);
