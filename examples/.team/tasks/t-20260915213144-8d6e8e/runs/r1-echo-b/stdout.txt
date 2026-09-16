@@ -1,0 +1,6 @@
+<<<TEAM_EVENT_V1
+{"type":"issue","body":"[echo-b] weakest point in artifact 48f64147c4e3: unverified assumptions need scrutiny (mock finding)","claims":["mock claim from echo-b"]}
+TEAM_EVENT_V1>>>
+<<<TEAM_RESULT_V1
+{"type":"critique","summary":"[echo-b] mock critique of artifact 48f64147c4e3: identified 3 weakest points — assumptions, missing failure-mode analysis, unbounded scope. (echo adapter)","claims":["artifact makes unsupported assumptions (mock)","failure modes are not enumerated (mock)","scope is unbounded (mock)"],"replies":[]}
+TEAM_RESULT_V1>>>

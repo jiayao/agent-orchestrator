@@ -1,0 +1,1 @@
+{"event_id":"evt_0000","seq":0,"ts":"2026-09-15T21:31:44.898Z","actor":"orchestrator","type":"task_created","round":0,"reply_to":null,"body":"ask: test prompt"}

@@ -1,0 +1,6 @@
+<<<TEAM_EVENT_V1
+{"type":"reply","reply_to":"evt_0002","body":"[echo-a] cross-reviewing evt_0002: partial agreement — the assumptions critique stands, severity is debatable (mock)"}
+TEAM_EVENT_V1>>>
+<<<TEAM_RESULT_V1
+{"type":"position","summary":"[echo-a] mock cross-review position for round 2: converging on 'assumptions' as the top issue (echo adapter)","claims":["converged on top issue (mock)"],"replies":[{"reply_to":"evt_0002","body":"[echo-a] agrees with the core issue raised (mock)"}]}
+TEAM_RESULT_V1>>>

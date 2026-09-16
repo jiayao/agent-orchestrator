@@ -1,0 +1,6 @@
+<<<TEAM_EVENT_V1
+{"type":"issue","body":"[echo-a] weakest point in artifact 95088b66f2ee: unverified assumptions need scrutiny (mock finding)","claims":["mock claim from echo-a"]}
+TEAM_EVENT_V1>>>
+<<<TEAM_RESULT_V1
+{"type":"critique","summary":"[echo-a] mock critique of artifact 95088b66f2ee: identified 3 weakest points — assumptions, missing failure-mode analysis, unbounded scope. (echo adapter)","claims":["artifact makes unsupported assumptions (mock)","failure modes are not enumerated (mock)","scope is unbounded (mock)"],"replies":[]}
+TEAM_RESULT_V1>>>

@@ -1,0 +1,16 @@
+{
+  "run_id": "r1-echo-b",
+  "task_id": "t-20260915213226-e3b9ed",
+  "agent_id": "echo-b",
+  "round": 1,
+  "status": "succeeded",
+  "exit_code": 0,
+  "signal": null,
+  "started_at": "2026-09-15T21:32:26.541Z",
+  "ended_at": "2026-09-15T21:32:26.583Z",
+  "latency_ms": 41,
+  "timed_out": false,
+  "output_limited": false,
+  "cost_usd": 0,
+  "cost_source": "estimated"
+}

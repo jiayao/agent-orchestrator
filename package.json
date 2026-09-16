@@ -1,0 +1,17 @@
+{
+  "name": "team-orchestrator",
+  "version": "0.1.0",
+  "description": "Local-first agent orchestration layer (team manager) - v0",
+  "type": "module",
+  "bin": {
+    "team": "./bin/team.ts"
+  },
+  "scripts": {
+    "dev": "bun run bin/team.ts",
+    "build": "bun build --compile --minify ./bin/team.ts --outfile team",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0"
+  }
+}

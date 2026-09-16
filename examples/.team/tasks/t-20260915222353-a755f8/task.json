@@ -1,0 +1,19 @@
+{
+  "id": "t-20260915222353-a755f8",
+  "kind": "ask",
+  "state": "completed",
+  "created_at": "2026-09-15T22:23:53.851Z",
+  "updated_at": "2026-09-15T22:23:53.915Z",
+  "started_at": "2026-09-15T22:23:53.851Z",
+  "artifact_sha256": "b28387d93de33c216574091449194454cbe23b70eb35a828338517be6ba5e480",
+  "artifact_label": "argv",
+  "team_sha256": "15e7f21cc358153ca7da68e1684683a110cdfa93356b0878c998f7a0fcb9e3de",
+  "agents": [
+    "echo-a",
+    "echo-b"
+  ],
+  "rounds_planned": 1,
+  "completed_rounds": 1,
+  "runs_completed": 2,
+  "estimated_cost_usd": 0
+}

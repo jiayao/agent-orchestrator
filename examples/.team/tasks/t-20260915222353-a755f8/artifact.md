@@ -1,0 +1,1 @@
+Is caching by session id safe?
