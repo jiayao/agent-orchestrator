@@ -167,8 +167,8 @@ export function validateConfig(raw: unknown, path: string): TeamConfig {
       agentIds.add(id);
 
       const kind = asString(a.kind) ?? "cli";
-      if (kind !== "cli" && kind !== "console") {
-        errors.push(`agent ${JSON.stringify(id)}: kind must be "cli" or "console"`);
+      if (kind !== "cli" && kind !== "console" && kind !== "bus") {
+        errors.push(`agent ${JSON.stringify(id)}: kind must be "cli", "console", or "bus"`);
       }
 
       const role = asString(a.role) ?? "";
@@ -190,13 +190,33 @@ export function validateConfig(raw: unknown, path: string): TeamConfig {
             cost_per_run_usd: asNumber(a.cost_per_run_usd),
             auth_env: authEnv, env: {},
           });
+        } else if (kind === "bus") {
+          const busUrl = asString(a.bus_url);
+          if (!busUrl || !/^https?:\/\/.+/.test(busUrl)) {
+            errors.push(`agent ${JSON.stringify(id)}: kind "bus" requires bus_url (http(s)://...)`);
+          }
+          const tokenEnv = asString(a.token_env);
+          if (!tokenEnv || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(tokenEnv)) {
+            errors.push(`agent ${JSON.stringify(id)}: kind "bus" requires token_env (an env var name)`);
+          }
+          const channel = asString(a.channel);
+          if (a.channel !== undefined && (!channel || !/^[A-Za-z0-9_-]{1,128}$/.test(channel))) {
+            errors.push(`agent ${JSON.stringify(id)}: channel must match [A-Za-z0-9_-]{1,128}`);
+          }
+          agents.push({
+            id, kind: "bus", adapter: asString(a.adapter) ?? "bus",
+            model: asString(a.model), role, cost_tier: asString(a.cost_tier),
+            cost_per_run_usd: asNumber(a.cost_per_run_usd),
+            auth_env: authEnv, env: {},
+            bus_url: busUrl, channel, token_env: tokenEnv,
+          });
         } else {
           errors.push(`agent ${JSON.stringify(id)}: missing [agents.command]`);
         }
         continue;
       }
-      if (kind === "console") {
-        errors.push(`agent ${JSON.stringify(id)}: kind "console" must not have [agents.command]`);
+      if (kind === "console" || kind === "bus") {
+        errors.push(`agent ${JSON.stringify(id)}: kind "${kind}" must not have [agents.command]`);
       }
       const executable = asString(cmd.executable);
       if (!executable) errors.push(`agent ${JSON.stringify(id)}: command.executable required`);

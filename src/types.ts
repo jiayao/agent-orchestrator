@@ -2,11 +2,13 @@
 
 export type StdinMode = "prompt" | "null";
 
-export type AgentKind = "cli" | "console";
+export type AgentKind = "cli" | "console" | "bus";
 
 export type ChatSignal = "continue" | "pass" | "propose_close" | "abort";
 
-export type ChatEndReason = "agreed" | "aborted" | "expired" | "budget" | "cancelled";
+export type ChatEndReason =
+  | "agreed" | "aborted" | "expired" | "budget" | "cancelled"
+  | "idle_timeout";
 
 export type RunStatus =
   | "succeeded"
@@ -48,8 +50,13 @@ export interface AgentConfig {
   /** env var name that holds this agent's credential; passed through to the
    *  child and probed (presence only) by `team doctor` */
   auth_env?: string;
-  command?: CommandProfile; // required for kind "cli", absent for "console"
+  command?: CommandProfile; // required for kind "cli", absent for "console"/"bus"
   env: Record<string, string>;
+  // kind "bus" (v0.2): participant on a reachable relay channel
+  bus_url?: string;
+  channel?: string; // default/pinned channel; `team chat` provisions a fresh one per chat
+  /** env var name holding this participant's bearer token (minted at provisioning) */
+  token_env?: string;
 }
 
 export interface StderrPattern {
@@ -130,6 +137,22 @@ export interface TeamEvent {
   run_id?: string;
   signal?: ChatSignal; // chat "turn" events
   malformed?: boolean; // chat "turn" events whose result envelope was absent/broken
+  /** bus (v0.2): wire metadata for records sourced from the relay.
+   *  On accepted "turn" events: {channel, seq, msg_id, author, in_reply_to,
+   *  payload_hash}. On "bus_raw" records: the relayed envelope as observed.
+   *  On "chat_ended": {channel, seq, msg_id, reason, terminal_seq}. */
+  bus?: {
+    channel: string;
+    seq: number; // relay-assigned channel seq
+    msg_id: string;
+    author?: string;
+    in_reply_to?: number | null;
+    payload_hash?: string;
+    control?: "chat_started" | "chat_ended"; // committed control records
+    first_speaker?: string; // chat_started
+    reason?: string; // chat_ended
+    terminal_seq?: number; // chat_ended
+  };
 }
 
 export interface ChatMeta {
@@ -140,6 +163,15 @@ export interface ChatMeta {
   substantive_turns: number;
   total_turns: number;
   end_reason?: ChatEndReason;
+  /** bus (v0.2) chat: provisioned channel coordinates. Secrets live in
+   *  bus.secret.json in the task dir, never here. */
+  bus?: {
+    bus_url: string;
+    channel: string;
+    epoch: string;
+    participants: [string, string];
+    first_speaker: string;
+  };
 }
 
 export interface TaskMeta {

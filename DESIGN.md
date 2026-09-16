@@ -178,6 +178,59 @@ Explicitly not in v0.1: group chat (3+ agents), asynchronous console replies (no
 Typed issue tracking (accept/reject/merge/defer per issue instead of per response), human-editable digest for mid-flight steering, Devin adapter, adaptive round termination, @mentions/threading, SKILL.md hardened after the interface survives real use.
 Borrowed from [Buzz](https://github.com/block/buzz) (read 2026-09-15): adapters converging on a protocol harness (their ACP harness for Goose/Codex/Claude Code) rather than N bespoke CLI profiles; a hash-chained audit log (their `buzz-audit` crate) as the tamper-evident future of the taste/decision log — the enterprise-audit story.
 
+## Message bus (v0.2)
+
+**Problem.** v0.1 chat moves turns through the orchestrator's process: `cli` agents are local subprocesses (or SSH to a reachable host), `console` is a live operator at a TTY. That doesn't reach agents behind NAT without inbound-access tricks. The bus inverts the topology: the bus is a reachable relay and every participant connects to it directly.
+
+**Symmetry.** There is no privileged seat. Grok's bot, Juno, any future agent — each is a bus participant that publishes its own turns and subscribes to the peer's. (An earlier draft bridged local agents through the orchestrator; the relationship is symmetric, so the bridge went.)
+
+**Trust model: the relay is our infrastructure.** Two rounds of adversarial review (omp, Codex, 2026-09-15) killed the "untrusted relay" framing: with a shared channel secret there is no authorship, and a relay trusted for ordering is the conversation's consensus authority. Rather than hardening v0.2 up to those claims, v0.2 narrows the claims to the deployment: the relay is the operator's own service (the reference build runs on Fly), trusted the way any server you run is trusted. The threat model is crash-faults and network observers — not a Byzantine relay. Message bodies stay AEAD-encrypted under the channel secret, so outsiders see no plaintext. What the relay does see — sizes, timing, IPs — is stated plainly instead of "learns nothing." Hash-chained envelopes, equivocation detection, and per-participant keypairs move to v-later, if the relay is ever third-party. Documented upgrade trigger: the day the relay isn't ours.
+
+**Authorship without keypairs.** One bearer token per participant, minted at provisioning. The relay attests authorship: every stored message carries `author` as observed on the authenticated POST. Self-wake filtering keys on attested author plus the participant's own `msg_id` history. Forging authorship now requires the relay's cooperation, which the trust model excludes.
+
+**What it is.** A minimal relay server. One channel per chat. Append-only per-channel log. HTTPS: `POST /c/{channel}/messages` to publish, `GET /c/{channel}/messages?since={seq}` long-poll to subscribe. The relay assigns `seq`, attests `author`, and is otherwise dumb: no agent logic, no arbitration. Its specified semantics are small but load-bearing, not "dumb on purpose":
+
+- `msg_id` dedupe: a POST with a previously seen `msg_id` returns the original `{seq}` without appending. Retries are always safe.
+- One linearizable log per channel: a single relay instance owns a channel in v0.2; `seq` is assigned at commit; a subscriber never sees a committed seq disappear or a gap fill in later.
+- Auditor lease: the relay grants one auditor lease per channel and rejects a second. The lease finally has a legal home, because the relay is trusted infra.
+
+**Turn-taking with an owner.** Pairwise strict alternation, stated as a deterministic validation rule every party applies locally to the relay log — so participants and auditor agree without coordinating:
+
+- The opening control message (author `orchestrator`) names the first speaker. No t=0 deadlock.
+- Every turn carries `in_reply_to`: the seq of the peer turn it answers.
+- Expected-speaker rule: after an accepted turn by A, only B's turn is protocol-valid. A second turn from the same author with the same `in_reply_to` is a duplicate and is ignored.
+- The auditor commits two kinds of records: raw records (everything the relay served) and accepted turns (passing validation). Only accepted turns drive budgets, history, and end reasons. Spam, duplicates, and late turns are preserved in the raw log but can never burn the budget or rewrite history.
+
+**Liveness: every gap has an owner.**
+
+- Publish ambiguity: the sender owns retries. Stable client-generated `msg_id` plus relay dedupe means a retry is either a no-op (it landed) or the actual publish (it didn't). There is no "did it land?" window.
+- Lost turn: whoever is waiting owns the deadline. If B hasn't answered A's turn within the reply window, A's runtime re-publishes the same `msg_id` — dedupe collapses it if the relay already has it, appends it if the relay lost it. Either way the conversation moves.
+- Non-response: the auditor owns the idle deadline. No accepted turn within the idle timeout — the auditor publishes `chat_ended{idle_timeout}` and commits it. Termination is auditor-imposed; the design says so instead of "observed."
+- Participant crash windows: at-least-once processing with idempotent effects. The runtime advances its inbound cursor only after the turn's effects are durable, and keys idempotency on a durable seen-`msg_id` set. Cursor loss replays from the last committed cursor; duplicates collapse on `msg_id`. One cursor is never asked to mean both "received" and "committed."
+
+**The auditor.** Subscribes, validates, commits. Every accepted turn is a `turn` event carrying `{channel, seq, msg_id, author, in_reply_to, payload_hash}`. No separate cursor file: the cursor is derived as max committed seq in `events.jsonl` — one file, no atomicity theater. Crash — resubscribe from the derived cursor — only new seqs arrive. Control messages (only `chat_ended` in v0.2) carry deterministic `msg_id`s derived from `{channel_epoch, terminal_seq, reason}`; on startup the auditor re-publishes any committed terminal control, and relay + participant dedupe make the replay harmless. The old publish/commit window survives only here, and idempotent redelivery closes it.
+
+**Participant runtimes.** Grok's bot loop and Juno's hook runtime are the same shape: durable inbound cursor (advances only after effects commit), seen-`msg_id` set, outbox of unacked publishes retried with backoff, serialized wakeups with control-message priority (`abort`/`chat_ended` jump the queue, and a pre-publish check drops turns made stale by a newer message), authorship filter on attested author + own msg_ids, bounded queue that coalesces to the latest unanswered peer turn. Strict alternation bounds the backlog naturally: each side can have at most one unanswered turn outstanding.
+
+**`bus` agent kind.** In team.toml:
+
+```toml
+[[agents]]
+id = "grok"
+kind = "bus"
+bus_url = "https://relay.example.com"
+channel = "chat-001"
+token_env = "TEAM_BUS_TOKEN_GROK"
+```
+
+`team chat --agents grok,juno --topic "..."` provisions the channel (random id + epoch), mints per-participant tokens plus the channel secret, prints connection instructions per side, and starts the auditor. Tokens are bearer, single-channel, operator-revocable at the relay. The provisioning channel is this one — trusted, stated.
+
+**Hosting.** Reference relay on Fly; `team bus-serve` for local dev. The relay holds channel tokens, the auditor lease, and dedupe state; it sees ciphertext and metadata, never plaintext.
+
+**Explicitly out of v0.2:** Byzantine relay defenses, per-participant keypairs, token rotation, group channels.
+
+**Scope note.** SSH-per-turn remains the path for reachable hosts. The bus is for agents that can only dial out.
+
 ## Open questions
 
 - Project name.

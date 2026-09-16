@@ -107,6 +107,7 @@ export class Blackboard {
       ...(ev.run_id ? { run_id: ev.run_id } : {}),
       ...(ev.signal ? { signal: ev.signal } : {}),
       ...(ev.malformed ? { malformed: true } : {}),
+      ...(ev.bus ? { bus: ev.bus } : {}),
     };
     await appendFile(this.eventsPath(taskId), JSON.stringify(full) + "\n");
     return full;
@@ -195,11 +196,20 @@ export class Blackboard {
     for (const [round, evs] of [...rounds.entries()].sort((a, b) => a[0] - b[0])) {
       lines.push(`## Round ${round}`, "");
       for (const ev of evs) {
+        if (ev.type === "bus_raw") {
+          // everything the relay served, one line each — full wire detail is in events.jsonl
+          lines.push(
+            `- raw ch_seq=${ev.bus?.seq ?? "?"} author=${ev.bus?.author ?? ev.actor} msg_id=${ev.bus?.msg_id ?? "?"}${ev.unstructured ? " [undecryptable]" : ""}`,
+            ""
+          );
+          continue;
+        }
         const flag = ev.unstructured ? " [unstructured]" : "";
         const sig = ev.signal ? ` signal=${ev.signal}` : "";
         const mal = ev.malformed ? " [malformed]" : "";
         const reply = ev.reply_to ? ` (reply to ${ev.reply_to})` : "";
-        lines.push(`### ${ev.event_id} — ${ev.actor} · ${ev.type}${reply}${sig}${flag}${mal}`, "");
+        const chSeq = ev.bus ? ` ch_seq=${ev.bus.seq}` : "";
+        lines.push(`### ${ev.event_id} — ${ev.actor} · ${ev.type}${chSeq}${reply}${sig}${flag}${mal}`, "");
         lines.push(ev.body, "");
         if (ev.claims?.length) {
           for (const c of ev.claims) lines.push(`- ${c}`);

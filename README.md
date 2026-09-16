@@ -98,7 +98,8 @@ for omp (its ~110s practical ceiling) — see `examples/team.toml`.
 | `team workshop --resume <task-id>` | Continue from last completed round; finished runs are never respawned |
 | `team arbitrate <task-id>` | Interactive pick, or non-interactive `--accept <event-id>` / `--reject <event-id>` / `--merge <id1,id2>` / `--defer`, with optional `--rationale "..."` |
 | `team verdict <task-id> good\|bad\|mixed [note]` | Record the realized outcome to the task + taste log |
-| `team chat --agents a,b --topic "..."` | Pairwise dialogue, orchestrator relays turns; `--resume <task-id>` re-prompts the last committed actor |
+| `team chat --agents a,b --topic "..."` | Pairwise dialogue, orchestrator relays turns; `--resume <task-id>` re-prompts the last committed actor. With `kind = "bus"` agents it provisions a relay channel and starts the auditor instead |
+| `team bus-serve [--port 8787]` | Local in-memory message-bus relay for development (`team chat` against `kind = "bus"` agents) |
 | `team export <task-id> [--out path]` | Deterministic JSON bundle: inputs, events, decisions, run metrics |
 
 Chat turn signals (inside the `TEAM_RESULT_V1` envelope): `continue`,
@@ -108,13 +109,81 @@ closing turn, then the chat ends `agreed`), `abort`. End reasons are honest:
 ends `expired`, never `completed`. The topic and instructions are pinned
 and never truncated; older whole turns fall off the transcript budget and
 each truncation is recorded as a `history_truncated` event. Agent kinds:
-`cli` (spawned subprocess) and `console` (the orchestrator prints the
+`cli` (spawned subprocess), `console` (the orchestrator prints the
 transcript and blocks for a live operator reply, with a wall-clock timeout;
-needs a TTY).
+needs a TTY), and `bus` (a peer on an outbound-only message bus — see
+"Message bus (v0.2)" below).
 
 Global flags: `--json` (machine-readable output on every command),
 `--print-prompt` (dry-run the composed prompts on `ask`/`workshop` without
 spawning), `--config <path>` (default `./team.toml`).
+
+## Message bus (v0.2)
+
+The bus is for agents that cannot accept inbound connections: every party —
+both participants and the auditor — only ever makes outbound requests to a
+relay. `team chat --agents a,b` with two `kind = "bus"` agents provisions a
+channel, prints connection instructions per side, and runs the auditor.
+
+Agent config:
+
+```toml
+[[agents]]
+id = "grok"
+kind = "bus"
+bus_url = "https://relay.example.com"   # the relay this agent can reach
+channel = "chat-001"                    # optional pinned channel
+token_env = "TEAM_BUS_TOKEN_GROK"       # env var holding this agent's bearer token
+```
+
+Development relay:
+
+```sh
+team bus-serve --port 8787              # in-memory; restart loses everything
+export TEAM_BUS_ADMIN_TOKEN=...         # printed once if not provided
+team chat --agents grok,juno --topic "..." --idle-timeout 120000
+```
+
+Provisioning mints a random channel id and epoch, one bearer token per
+participant (plus the auditor's `orchestrator` token), and the shared
+channel secret; registers the channel over the relay's admin API; writes
+secrets to `.team/tasks/<id>/bus.secret.json` (mode 0600, never in
+`meta.json`); and prints per-side connection instructions — everything a
+participant needs to talk on the wire.
+
+Relay endpoints (bearer auth; `POST /admin/*` takes the admin token):
+
+- `POST /admin/channels` — provision `{channel, epoch, tokens: {author: token}}`; requires an `orchestrator` author.
+- `DELETE /admin/channels/<channel>/tokens/<author>` — revoke a participant.
+- `POST /c/<channel>/messages` — publish `{msg_id, nonce, ct}`; `author` is attested from the token. Retried `msg_id` returns the original `seq` (`deduped: true`) and never appends twice.
+- `GET /c/<channel>/messages?since=<seq>&wait=<ms>` — long-poll; returns `{messages, latest}` with `seq` greater than `since`.
+- `POST /c/<channel>/auditor` — take the auditor lease; one per channel, a second author gets 409.
+
+On the wire, `ct` is the turn payload AEAD-encrypted under the channel
+secret (AES-256-GCM, random nonce, AAD `"<channel>:<msg_id>"`). Turn-taking
+is a deterministic rule every party applies to the log: the auditor's
+opening control names the first speaker, each turn carries `in_reply_to`
+(the seq of the peer turn it answers), and after an accepted turn only the
+other participant's turn is valid — duplicates collapse on
+`(author, in_reply_to)`. The auditor commits `bus_raw` records for
+everything relayed and `turn` events only for accepted turns; only accepted
+turns drive budgets, history, and end reasons. The auditor owns the idle
+deadline and imposes termination — `chat_ended` is always published by the
+auditor, with control msg_ids deterministic from
+`{channel_epoch, terminal_seq, reason}` so a restarted auditor's re-publish
+is a harmless duplicate. There is no cursor file: the auditor's cursor is
+the max committed relay seq in `events.jsonl`.
+
+Trust model: the relay is trusted operator infrastructure you run yourself
+(the reference deployment is Fly) — trusted the way any server you operate
+is trusted, not trusted to be honest under attack. The threat model is
+crash faults and network observers, not a Byzantine relay. Message bodies
+are AEAD-encrypted under the channel secret, so the relay stores ciphertext
+and observes metadata — message sizes, timing, source IPs, which tokens
+authenticate — while it attests authorship, assigns sequence numbers, and
+enforces the single auditor lease. Anyone holding the channel secret reads
+every message on the channel; anyone holding a participant token writes as
+that participant.
 
 ## Agent output contract
 

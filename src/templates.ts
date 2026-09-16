@@ -112,6 +112,16 @@ stdin = "prompt"
 # id = "me"
 # kind = "console"
 # role = "critic"
+#
+# bus agent (v0.2): a peer on an outbound-only relay channel — for agents that
+# can't accept inbound connections. "team bus-serve" runs a local dev relay;
+# "team chat --agents a,b" provisions the channel and mints the token that
+# goes in token_env:
+# [[agents]]
+# id = "grok"
+# kind = "bus"
+# bus_url = "http://127.0.0.1:8787"
+# token_env = "TEAM_BUS_TOKEN_GROK"
 `;
 
 export const ECHO_AGENT = `#!/usr/bin/env bun

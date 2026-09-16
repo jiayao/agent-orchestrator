@@ -17,6 +17,14 @@ import {
 } from "./chat.ts";
 import { ECHO_AGENT, EXAMPLE_ARTIFACT, TEAM_TOML } from "./templates.ts";
 import type { AgentConfig, DecisionRecord, TaskMeta, TeamConfig } from "./types.ts";
+import { startRelay } from "./bus/relay.ts";
+import { newToken } from "./bus/crypto.ts";
+import {
+  connectionInstructions,
+  provisionBusChat,
+  runBusChatSession,
+  writeBusSecrets,
+} from "./bus/session.ts";
 
 interface ParsedArgs {
   command: string;
@@ -71,7 +79,12 @@ commands:
   ask [--agents a,b] <prompt>         fan one prompt out to N agents
   chat --agents a,b --topic "..."     pairwise dialogue, orchestrator as relay
       [--max-turns N] [--history-budget chars] [--console-timeout ms]
+      bus agents: provisions a channel on the relay, prints per-side
+      connection instructions, starts the auditor
+      [--idle-timeout ms] [--bus-admin-token T | env TEAM_BUS_ADMIN_TOKEN]
   chat --resume <task-id>             continue a cancelled/interrupted chat
+  bus-serve [--port 8787]             local dev relay (in-memory; prod = Fly)
+      [--admin-token T | env TEAM_BUS_ADMIN_TOKEN]
   workshop <artifact.md> [--rounds N] bounded review: critique, cross-review, awaiting_decision
   workshop --resume <task-id>         continue from the last completed round
   arbitrate <task-id>                 interactive pick, or:
@@ -207,6 +220,37 @@ async function cmdDoctor(args: ParsedArgs): Promise<void> {
   const warnings: string[] = [];
   const agentReports: Record<string, unknown>[] = [];
   for (const agent of config.agents) {
+    if (agent.kind === "bus") {
+      const rep: Record<string, unknown> = {
+        id: agent.id,
+        kind: "bus",
+        adapter: agent.adapter,
+        model: agent.model ?? null,
+        role: agent.role,
+        bus_url: agent.bus_url,
+        channel: agent.channel ?? null,
+        token_env: agent.token_env ?? null,
+      };
+      const tok = agent.token_env ? process.env[agent.token_env] : undefined;
+      rep.token = tok ? `present (${agent.token_env})` : `missing (${agent.token_env})`;
+      if (!tok) warnings.push(`agent ${agent.id}: ${agent.token_env} not set`);
+      // probe the relay + configured channel when token + channel are known
+      if (tok && agent.bus_url && agent.channel) {
+        try {
+          const res = await fetch(
+            `${agent.bus_url.replace(/\/+$/, "")}/c/${encodeURIComponent(agent.channel)}/messages?since=0&wait=0`,
+            { headers: { authorization: `Bearer ${tok}` } }
+          );
+          rep.relay = res.ok ? "reachable" : `reachable but rejected (${res.status})`;
+          if (!res.ok) rep.warning = `relay returned ${res.status} for channel ${agent.channel}`;
+        } catch (e) {
+          rep.relay = `unreachable (${(e as Error).message})`;
+          rep.warning = `bus_url unreachable`;
+        }
+      }
+      agentReports.push(rep);
+      continue;
+    }
     if (agent.kind === "console") {
       agentReports.push({
         id: agent.id,
@@ -293,6 +337,38 @@ async function cmdTasks(args: ParsedArgs): Promise<void> {
     }
     if (!tasks.length) log("no tasks yet");
   }
+}
+
+/**
+ * `team bus-serve` — local dev relay. In-memory: a restart loses channels,
+ * tokens, dedupe state, and the log (the reference deployment is a persistent
+ * relay on Fly). The admin token guards provisioning; with no flag/env a
+ * random one is minted and printed once — the operator's terminal is the
+ * trusted provisioning channel.
+ */
+async function cmdBusServe(args: ParsedArgs): Promise<void> {
+  const port = numFlag(args.flags.get("port")) ?? 8787;
+  const flagTok = args.flags.get("admin-token");
+  const generated = flagTok === undefined && !process.env.TEAM_BUS_ADMIN_TOKEN;
+  const adminToken =
+    (typeof flagTok === "string" ? flagTok : undefined) ??
+    process.env.TEAM_BUS_ADMIN_TOKEN ??
+    newToken();
+  const relay = startRelay({ port, adminToken });
+  if (args.json) {
+    printJson({ ok: true, url: relay.url, port: relay.port, admin_token: adminToken });
+  } else {
+    log(`bus relay listening on ${relay.url} (in-memory, dev only)`);
+    if (generated) {
+      log(`admin token: ${adminToken}`);
+      log(`export TEAM_BUS_ADMIN_TOKEN=${adminToken}   # for team chat provisioning`);
+    }
+  }
+  process.on("SIGINT", () => {
+    relay.stop();
+    process.exit(0);
+  });
+  await new Promise(() => {}); // serve until killed
 }
 
 async function cmdAsk(args: ParsedArgs): Promise<void> {
@@ -450,6 +526,7 @@ async function cmdChat(args: ParsedArgs): Promise<void> {
 
   let meta: TaskMeta;
   let agents: AgentConfig[];
+  let busInstructions: Record<string, string> | undefined;
 
   if (resumeId !== undefined) {
     const id = String(resumeId);
@@ -471,9 +548,16 @@ async function cmdChat(args: ParsedArgs): Promise<void> {
   } else {
     const topicFlag = args.flags.get("topic");
     const topic = (typeof topicFlag === "string" ? topicFlag : args.positional.join(" ")).trim();
-    if (!topic) fail('usage: team chat --agents a,b --topic "..." [--max-turns N] [--history-budget chars] [--console-timeout ms] | team chat --resume <task-id>', 2);
+    if (!topic) fail('usage: team chat --agents a,b --topic "..." [--max-turns N] [--history-budget chars] [--console-timeout ms] [--idle-timeout ms] | team chat --resume <task-id>', 2);
     agents = selectAgents(config, args.flags.get("agents"));
     if (agents.length !== 2) fail(`chat requires exactly two agents (got ${agents.length}); use --agents a,b`);
+    const anyBus = agents.some((a) => a.kind === "bus");
+    if (anyBus && !agents.every((a) => a.kind === "bus")) {
+      fail(
+        "bus chats need all participants kind=bus — v0.2 has no bridge: " +
+          "every participant is a symmetric peer on the relay"
+      );
+    }
     mkdirSync(bb.teamDir, { recursive: true });
     meta = newMeta("chat", config, topic, "topic", agents, maxTurns ?? config.chat.max_turns);
     meta.chat = {
@@ -484,10 +568,92 @@ async function cmdChat(args: ParsedArgs): Promise<void> {
       substantive_turns: 0,
       total_turns: 0,
     };
-    bb.initTask(meta, topic);
+    if (anyBus) {
+      const busUrl = agents[0].bus_url!;
+      if (agents[1].bus_url !== busUrl) {
+        fail("bus agents must share one bus_url — a channel lives on a single relay instance");
+      }
+      if (args.printPrompt) {
+        const out = {
+          ok: true, dry_run: true, kind: "bus",
+          bus_url: busUrl, first_speaker: agents[0].id,
+          opening: {
+            author: "orchestrator",
+            payload: { v: 1, type: "control", control: "chat_started", first_speaker: agents[0].id, topic },
+          },
+          note: "provisioning mints channel id + epoch, per-participant tokens, and the channel secret",
+        };
+        if (args.json) printJson(out);
+        else { log(JSON.stringify(out, null, 2)); }
+        return;
+      }
+      const flagTok = args.flags.get("bus-admin-token");
+      const adminToken =
+        (typeof flagTok === "string" ? flagTok : undefined) ?? process.env.TEAM_BUS_ADMIN_TOKEN;
+      if (!adminToken) {
+        fail("bus provisioning needs the relay admin token (--bus-admin-token or TEAM_BUS_ADMIN_TOKEN)");
+      }
+      const prov = await provisionBusChat(busUrl, adminToken, [agents[0], agents[1]]);
+      meta.chat.bus = {
+        bus_url: busUrl,
+        channel: prov.channel,
+        epoch: prov.epoch,
+        participants: [agents[0].id, agents[1].id],
+        first_speaker: agents[0].id,
+      };
+      bb.initTask(meta, topic);
+      writeBusSecrets(bb, meta.id, {
+        channel_secret: prov.secret,
+        tokens: prov.tokens,
+      });
+      busInstructions = {
+        [agents[0].id]: connectionInstructions(prov, agents[0], agents[1].id),
+        [agents[1].id]: connectionInstructions(prov, agents[1], agents[0].id),
+      };
+      for (const id of agents.map((a) => a.id)) {
+        log(busInstructions[id]);
+        log("");
+      }
+    } else {
+      bb.initTask(meta, topic);
+    }
   }
 
   const ids: [string, string] = [agents[0].id, agents[1].id];
+
+  // bus chat: the auditor subscribes to the provisioned channel and commits
+  // raw records + accepted turns; participants connect themselves.
+  if (meta.chat?.bus) {
+    const idleTimeoutMs = numFlag(args.flags.get("idle-timeout"));
+    try {
+      const summary = await runBusChatSession(bb, config, meta, {
+        idleTimeoutMs,
+        maxTurns,
+        onEvent: (ev) => {
+          if (!args.json && ev.type === "turn") {
+            log(`\n--- turn ${ev.event_id} — ${ev.actor} (ch_seq=${ev.bus?.seq ?? "?"})${ev.signal ? ` signal=${ev.signal}` : ""} ---`);
+            log(ev.body.length > 800 ? ev.body.slice(0, 800) + "…" : ev.body);
+          }
+        },
+      });
+      if (args.json) {
+        printJson({
+          ok: true,
+          ...summary,
+          bus: meta.chat.bus,
+          instructions: busInstructions ?? null,
+          events: bb.readEvents(meta.id),
+        });
+      } else {
+        log(`\nchat ${meta.id} — ${summary.state} (end_reason=${summary.end_reason})`);
+        log(`channel: ${meta.chat.bus.channel} on ${meta.chat.bus.bus_url}`);
+        log(`view: ${bb.viewPath(meta.id)}`);
+      }
+    } catch (e) {
+      fail((e as Error).message);
+    }
+    return;
+  }
 
   if (args.printPrompt) {
     const events = bb.readEvents(meta.id);
@@ -708,6 +874,7 @@ export async function main(argv: string[]): Promise<number> {
       case "tasks": return await wrap(args, () => cmdTasks(args));
       case "ask": return await wrap(args, () => cmdAsk(args));
       case "chat": return await wrap(args, () => cmdChat(args));
+      case "bus-serve": return await wrap(args, () => cmdBusServe(args));
       case "workshop": return await wrap(args, () => cmdWorkshop(args));
       case "arbitrate": return await wrap(args, () => cmdArbitrate(args));
       case "verdict": return await wrap(args, () => cmdVerdict(args));
