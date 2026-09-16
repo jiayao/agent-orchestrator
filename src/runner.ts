@@ -163,7 +163,7 @@ export async function runRound(
       const prompt = composePrompt({
         config,
         agent,
-        kind: meta.kind,
+        kind: meta.kind as "workshop" | "ask", // chat tasks never reach the runner
         round,
         artifactText,
         artifactLabel: meta.artifact_label,

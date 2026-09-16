@@ -118,6 +118,11 @@ export class BusClient {
     return decryptPayload(this.secret, this.channel, msg.msg_id, { nonce: msg.nonce, ct: msg.ct });
   }
 
+  /** Decrypt persisted wire fields — used to re-validate committed records. */
+  decryptFields(msgId: string, nonce: string, ct: string): string {
+    return decryptPayload(this.secret, this.channel, msgId, { nonce, ct });
+  }
+
   /** One auditor lease per channel; a second author is rejected (409). */
   async requestAuditorLease(): Promise<{ auditor: string }> {
     let res: Response;
@@ -200,11 +205,19 @@ export async function adminMintClaim(
 
 export interface ClaimBundle {
   participant: string;
+  /** the channel's attested participant list (the auditor's "orchestrator"
+   *  author excluded); `participant` is always an entry */
+  participants: string[];
+  /** participants minus the redeemer — the provisioned peer id(s) */
+  peers: string[];
   token: string;
   channel_secret: string;
   channel: string;
   epoch: string;
 }
+
+const isStringArray = (v: unknown): v is string[] =>
+  Array.isArray(v) && v.every((x) => typeof x === "string");
 
 /**
  * Redeem a one-time claim URL. Single-use: a second fetch gets 410, an
@@ -215,9 +228,13 @@ export async function fetchClaim(claimUrl: string): Promise<ClaimBundle> {
   const res = await fetch(claimUrl);
   const body = await readBody(res);
   if (!res.ok) throw new BusError(`claim fetch rejected: ${body.error ?? res.status}`, res.status);
-  const { participant, token, channel_secret, channel, epoch } = body;
+  const { participant, participants, peers, token, channel_secret, channel, epoch } = body;
   if (
     typeof participant !== "string" ||
+    !isStringArray(participants) ||
+    !participants.includes(participant) ||
+    !isStringArray(peers) ||
+    peers.includes(participant) ||
     typeof token !== "string" ||
     typeof channel_secret !== "string" ||
     typeof channel !== "string" ||
@@ -225,5 +242,5 @@ export async function fetchClaim(claimUrl: string): Promise<ClaimBundle> {
   ) {
     throw new BusError("claim returned a malformed bundle", res.status);
   }
-  return { participant, token, channel_secret, channel, epoch };
+  return { participant, participants, peers, token, channel_secret, channel, epoch };
 }

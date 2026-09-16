@@ -13,6 +13,7 @@ import {
   chatProgress,
   packChatPrompt,
   runChat,
+  turnEventToAccepted,
   type ConsoleIO,
 } from "./chat.ts";
 import { ECHO_AGENT, EXAMPLE_ARTIFACT, TEAM_TOML } from "./templates.ts";
@@ -21,9 +22,12 @@ import { startRelay } from "./bus/relay.ts";
 import { newToken } from "./bus/crypto.ts";
 import {
   connectionInstructions,
+  joinBusChat,
   provisionBusChat,
   runBusChatSession,
+  runBusParticipant,
   writeBusSecrets,
+  type BusTurnAdapter,
 } from "./bus/session.ts";
 
 interface ParsedArgs {
@@ -85,6 +89,15 @@ commands:
   chat --resume <task-id>             continue a cancelled/interrupted chat
   bus-serve [--port 8787]             local dev relay (in-memory; prod = Fly)
       [--admin-token T | env TEAM_BUS_ADMIN_TOKEN]
+  join --from-claim-url <url>         redeem a one-time bus claim URL into
+      [--state-dir dir]               bus.credentials.json (0600): token,
+                                      channel secret, and the provisioned
+                                      peer id — never inferred from a turn
+  bus-run <task-id> --as <agent-id>   run one participant of a bus chat locally
+      [--adapter echo|cli|console] [--echo-close-after N] [--reply-timeout ms]
+      [--poll-wait ms] [--state-dir dir] [--steal-lock]
+      echo drives a scripted participant (demos, tests); cli spawns the
+      agent's command; console types turns in as the operator
   workshop <artifact.md> [--rounds N] bounded review: critique, cross-review, awaiting_decision
   workshop --resume <task-id>         continue from the last completed round
   arbitrate <task-id>                 interactive pick, or:
@@ -94,6 +107,7 @@ commands:
   export <task-id> [--out path]       deterministic bundle (inputs, events, decisions, metrics)
 
 global flags: --json  --print-prompt (ask, workshop, chat)  --config
+              --steal-lock  take over a task's runner lock when the holder is dead
 `;
 
 function log(msg: string) {
@@ -396,19 +410,27 @@ async function cmdAsk(args: ParsedArgs): Promise<void> {
     return;
   }
 
-  const summary = await runTaskRounds(bb, config, meta, agents, progressHooks(args.json));
-  const events = bb.readEvents(meta.id);
-  const agentEvents = events.filter((e) => e.actor !== "orchestrator" && e.type !== "issue");
+  const lock = bb.acquireLock(meta.id, {
+    steal: args.flags.has("steal-lock"),
+    cmd: `ask ${meta.id}`,
+  });
+  try {
+    const summary = await runTaskRounds(bb, config, meta, agents, progressHooks(args.json));
+    const events = bb.readEvents(meta.id);
+    const agentEvents = events.filter((e) => e.actor !== "orchestrator" && e.type !== "issue");
 
-  if (args.json) {
-    printJson({ ok: true, task_id: meta.id, state: meta.state, results: summary.results, events });
-  } else {
-    log(`\ntask ${meta.id} — ${meta.state}`);
-    for (const ev of agentEvents) {
-      console.log(`\n--- ${ev.actor} (${ev.type}) ${ev.unstructured ? "[unstructured]" : ""} ---`);
-      console.log(ev.body);
+    if (args.json) {
+      printJson({ ok: true, task_id: meta.id, state: meta.state, results: summary.results, events });
+    } else {
+      log(`\ntask ${meta.id} — ${meta.state}`);
+      for (const ev of agentEvents) {
+        console.log(`\n--- ${ev.actor} (${ev.type}) ${ev.unstructured ? "[unstructured]" : ""} ---`);
+        console.log(ev.body);
+      }
+      log(`\nblackboard: ${bb.taskDir(meta.id)}`);
     }
-    log(`\nblackboard: ${bb.taskDir(meta.id)}`);
+  } finally {
+    lock.release();
   }
 }
 
@@ -476,14 +498,22 @@ async function cmdWorkshop(args: ParsedArgs): Promise<void> {
     return;
   }
 
-  const summary = await runTaskRounds(bb, config, meta, agents, progressHooks(args.json));
-  if (args.json) {
-    printJson({ ok: true, task_id: meta.id, state: meta.state, budget_exceeded: summary.budgetExceeded ?? null, results: summary.results });
-  } else {
-    log(`\ntask ${meta.id} — ${meta.state}`);
-    if (summary.budgetExceeded) log(`budget: ${summary.budgetExceeded}`);
-    if (meta.state === "awaiting_decision") log(`next: team arbitrate ${meta.id}`);
-    log(`view: ${bb.viewPath(meta.id)}`);
+  const lock = bb.acquireLock(meta.id, {
+    steal: args.flags.has("steal-lock"),
+    cmd: `workshop ${meta.id}`,
+  });
+  try {
+    const summary = await runTaskRounds(bb, config, meta, agents, progressHooks(args.json));
+    if (args.json) {
+      printJson({ ok: true, task_id: meta.id, state: meta.state, budget_exceeded: summary.budgetExceeded ?? null, results: summary.results });
+    } else {
+      log(`\ntask ${meta.id} — ${meta.state}`);
+      if (summary.budgetExceeded) log(`budget: ${summary.budgetExceeded}`);
+      if (meta.state === "awaiting_decision") log(`next: team arbitrate ${meta.id}`);
+      log(`view: ${bb.viewPath(meta.id)}`);
+    }
+  } finally {
+    lock.release();
   }
 }
 
@@ -624,15 +654,19 @@ async function cmdChat(args: ParsedArgs): Promise<void> {
   const ids: [string, string] = [agents[0].id, agents[1].id];
 
   // bus chat: the auditor subscribes to the provisioned channel and commits
-  // raw records + accepted turns; participants connect themselves.
+  // one bus_record per wire message; participants connect themselves.
   if (meta.chat?.bus) {
     const idleTimeoutMs = numFlag(args.flags.get("idle-timeout"));
+    const lock = bb.acquireLock(meta.id, {
+      steal: args.flags.has("steal-lock"),
+      cmd: `chat ${resumeId !== undefined ? `--resume ${meta.id}` : meta.id} (bus auditor)`,
+    });
     try {
       const summary = await runBusChatSession(bb, config, meta, {
         idleTimeoutMs,
         maxTurns,
         onEvent: (ev) => {
-          if (!args.json && ev.type === "turn") {
+          if (!args.json && (ev.type === "turn" || (ev.type === "bus_record" && ev.verdict === "turn"))) {
             log(`\n--- turn ${ev.event_id} — ${ev.actor} (ch_seq=${ev.bus?.seq ?? "?"})${ev.signal ? ` signal=${ev.signal}` : ""} ---`);
             log(ev.body.length > 800 ? ev.body.slice(0, 800) + "…" : ev.body);
           }
@@ -653,6 +687,8 @@ async function cmdChat(args: ParsedArgs): Promise<void> {
       }
     } catch (e) {
       fail((e as Error).message);
+    } finally {
+      lock.release();
     }
     return;
   }
@@ -666,7 +702,7 @@ async function cmdChat(args: ParsedArgs): Promise<void> {
       agent,
       peerId: prog.nextActor === ids[0] ? ids[1] : ids[0],
       topic: meta.chat?.topic ?? bb.readArtifact(meta.id),
-      turns: prog.turns,
+      turns: prog.turns.map(turnEventToAccepted),
       historyBudgetChars: historyBudgetChars ?? meta.chat?.history_budget_chars ?? config.chat.history_budget_chars,
     });
     const out = { ok: true, dry_run: true, task_id: meta.id, next_actor: prog.nextActor, prompt: pack.prompt, omitted: pack.omitted };
@@ -675,6 +711,10 @@ async function cmdChat(args: ParsedArgs): Promise<void> {
     return;
   }
 
+  const lock = bb.acquireLock(meta.id, {
+    steal: args.flags.has("steal-lock"),
+    cmd: `chat ${meta.id}`,
+  });
   try {
     const summary = await runChat(bb, config, meta, agents, {
       maxTurns,
@@ -702,6 +742,124 @@ async function cmdChat(args: ParsedArgs): Promise<void> {
     }
   } catch (e) {
     fail((e as Error).message);
+  } finally {
+    lock.release();
+  }
+}
+
+/**
+ * `team join --from-claim-url <url>` — the remote side's onboarding. The
+ * claim URL is the only thing that ever traveled through a chat transcript;
+ * redeeming it once yields the bearer token, the channel secret, and the
+ * relay-attested participant list (which entry is us, which is the peer).
+ * Everything lands in `<state-dir>/bus.credentials.json` (0600); the
+ * attested identity is printed, the secrets never are.
+ */
+async function cmdJoin(args: ParsedArgs): Promise<void> {
+  const claimUrl = args.flags.get("from-claim-url");
+  if (typeof claimUrl !== "string" || !claimUrl) {
+    fail("usage: team join --from-claim-url <url> [--state-dir dir]", 2);
+  }
+  const dirFlag = args.flags.get("state-dir");
+  const stateDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
+  const { creds, path } = await joinBusChat(claimUrl, stateDir);
+  const report = {
+    ok: true,
+    participant: creds.participant,
+    participants: creds.participants,
+    peers: creds.peers,
+    channel: creds.channel,
+    epoch: creds.epoch,
+    bus_url: creds.bus_url,
+    credentials_file: path,
+    warning:
+      creds.peers.length !== 1
+        ? `expected a pairwise channel; provisioning attests ${creds.peers.length} peers`
+        : undefined,
+  };
+  if (args.json) {
+    printJson(report);
+  } else {
+    log(`joined channel ${creds.channel} (epoch ${creds.epoch}) on ${creds.bus_url}`);
+    log(`  you are:        ${creds.participant}`);
+    log(`  provisioned peer(s): ${creds.peers.join(", ") || "(none)"}`);
+    log(`  participants:   ${creds.participants.join(", ")}`);
+    if (report.warning) log(`  WARNING: ${report.warning}`);
+    log(`  credentials (0600): ${path}`);
+    log(`  the claim URL is dead — a second fetch returns 410.`);
+  }
+}
+
+/** Run one participant of a bus chat on this machine. */
+async function cmdBusRun(args: ParsedArgs): Promise<void> {
+  const config = await requireConfig(args.configPath);
+  const bb = new Blackboard(join(config.root, ".team"));
+  const taskId = args.positional[0];
+  const asFlag = args.flags.get("as");
+  if (!taskId || typeof asFlag !== "string" || !asFlag) {
+    fail(
+      "usage: team bus-run <task-id> --as <agent-id> [--adapter echo|cli|console] " +
+        "[--echo-close-after N] [--reply-timeout ms] [--poll-wait ms] [--state-dir dir] [--steal-lock]",
+      2
+    );
+  }
+  if (!bb.taskExists(taskId)) fail(`task not found: ${taskId}`);
+  const meta = bb.readMeta(taskId);
+  const bus = meta.chat?.bus;
+  if (!bus) fail(`task ${taskId} is not a bus chat (no provisioning to join)`);
+  if (!bus.participants.includes(asFlag)) {
+    fail(`agent ${JSON.stringify(asFlag)} is not a participant of ${taskId} (${bus.participants.join(", ")})`);
+  }
+  const agent = config.agents.find((a) => a.id === asFlag);
+  if (!agent) fail(`agent ${JSON.stringify(asFlag)} not found in config`);
+
+  const adapterFlag = args.flags.get("adapter");
+  if (
+    adapterFlag !== undefined &&
+    adapterFlag !== "echo" && adapterFlag !== "cli" && adapterFlag !== "console"
+  ) {
+    fail("--adapter must be echo|cli|console");
+  }
+  const adapter: BusTurnAdapter =
+    (adapterFlag as BusTurnAdapter | undefined) ??
+    (agent.adapter === "echo" ? "echo"
+      : agent.kind === "cli" ? "cli"
+      : agent.kind === "console" ? "console"
+      : "echo");
+  if (adapter === "cli" && !agent.command) {
+    fail(`agent ${asFlag} has kind=${agent.kind} but no [agents.command] — use --adapter echo or console`);
+  }
+  if (adapter === "console" && !process.stdin.isTTY) {
+    fail("console adapter needs a TTY — use --adapter echo for scripted runs");
+  }
+
+  // one live participant per (task, agent) — a different name than the
+  // auditor's runner.lock so both can run against the same task dir
+  const lock = bb.acquireLock(taskId, {
+    name: `participant-${asFlag}.lock`,
+    steal: args.flags.has("steal-lock"),
+    cmd: `bus-run ${taskId} --as ${asFlag}`,
+  });
+  try {
+    const stateDirFlag = args.flags.get("state-dir");
+    const summary = await runBusParticipant(bb, config, meta, {
+      agent,
+      adapter,
+      echoCloseAfter: numFlag(args.flags.get("echo-close-after")),
+      replyTimeoutMs: numFlag(args.flags.get("reply-timeout")),
+      pollWaitMs: numFlag(args.flags.get("poll-wait")),
+      stateDir: typeof stateDirFlag === "string" ? resolve(stateDirFlag) : undefined,
+      consoleIO: adapter === "console" ? realConsoleIO() : undefined,
+      consoleTimeoutMs: numFlag(args.flags.get("console-timeout")) ?? meta.chat?.console_timeout_ms,
+      onNote: args.json ? undefined : (s) => log(`  bus[${asFlag}] ${s}`),
+    });
+    if (args.json) {
+      printJson({ ok: true, task_id: taskId, ...summary });
+    } else {
+      log(`participant ${asFlag} done — ended=${summary.ended ?? "(aborted)"} turns=${summary.turns}`);
+    }
+  } finally {
+    lock.release();
   }
 }
 
@@ -877,6 +1035,8 @@ export async function main(argv: string[]): Promise<number> {
       case "ask": return await wrap(args, () => cmdAsk(args));
       case "chat": return await wrap(args, () => cmdChat(args));
       case "bus-serve": return await wrap(args, () => cmdBusServe(args));
+      case "join": return await wrap(args, () => cmdJoin(args));
+      case "bus-run": return await wrap(args, () => cmdBusRun(args));
       case "workshop": return await wrap(args, () => cmdWorkshop(args));
       case "arbitrate": return await wrap(args, () => cmdArbitrate(args));
       case "verdict": return await wrap(args, () => cmdVerdict(args));

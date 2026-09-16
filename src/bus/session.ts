@@ -5,14 +5,36 @@
 // with the relay over the admin API; writes secrets to bus.secret.json in the
 // task dir; prints connection instructions per side; then starts the auditor.
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Blackboard } from "../blackboard.ts";
-import type { AgentConfig, TaskMeta, TeamConfig } from "../types.ts";
-import type { ChatSummary } from "../chat.ts";
-import { adminMintClaim, adminProvisionChannel, BusClient, fetchClaim, type ClaimBundle } from "./client.ts";
+import type { AgentConfig, ChatSignal, TaskMeta, TeamConfig } from "../types.ts";
+import {
+  consoleTurn,
+  packChatPrompt,
+  parseChatResult,
+  type ChatSummary,
+  type ConsoleIO,
+} from "../chat.ts";
+import { buildSpawnSpec, spawnAgent } from "../spawn.ts";
+import type { AcceptedTurn } from "../chatcore.ts";
+import {
+  adminMintClaim,
+  adminProvisionChannel,
+  BusClient,
+  fetchClaim,
+  type ClaimBundle,
+  type FetchFn,
+} from "./client.ts";
 import { newChannelSecret, newId, newToken } from "./crypto.ts";
 import { runBusAuditor, type BusAuditorOptions } from "./auditor.ts";
+import {
+  ParticipantRuntime,
+  type ParticipantOptions,
+  type TranscriptTurn,
+  type TurnContext,
+  type TurnHandler,
+} from "./participant.ts";
 
 export interface BusSecrets {
   channel_secret: string;
@@ -102,10 +124,22 @@ export async function provisionBusChat(
  * The caller should write the token + secret to a local 0600 file and
  * never paste them into chat — the claim URL is the only thing that ever
  * traveled through the chat transcript, and it is dead after this call.
+ * The bundle also carries the relay-attested participant list: `peers` is
+ * the provisioned peer id(s), learned here rather than inferred from the
+ * first peer turn.
  */
 export async function claimBusSecrets(
   claimUrl: string
-): Promise<{ busUrl: string; channel: string; epoch: string; participant: string; token: string; secret: string }> {
+): Promise<{
+  busUrl: string;
+  channel: string;
+  epoch: string;
+  participant: string;
+  participants: string[];
+  peers: string[];
+  token: string;
+  secret: string;
+}> {
   const bundle: ClaimBundle = await fetchClaim(claimUrl);
   const busUrl = new URL(claimUrl).origin;
   return {
@@ -113,8 +147,120 @@ export async function claimBusSecrets(
     channel: bundle.channel,
     epoch: bundle.epoch,
     participant: bundle.participant,
+    participants: bundle.participants,
+    peers: bundle.peers,
     token: bundle.token,
     secret: bundle.channel_secret,
+  };
+}
+
+/**
+ * What the joining side persists after redeeming a claim: the credentials
+ * plus the relay-attested participant list, so the provisioned peer id is
+ * on disk next to the token — never inferred from the first peer turn.
+ */
+export interface JoinCredentials {
+  bus_url: string;
+  channel: string;
+  epoch: string;
+  /** this side's participant id */
+  participant: string;
+  /** the channel's attested participant list, including `participant` */
+  participants: string[];
+  /** participants minus `participant` — the provisioned peer id(s) */
+  peers: string[];
+  token: string;
+  channel_secret: string;
+}
+
+/** File name inside a join state dir (mode 0600). */
+export const JOIN_CREDENTIALS_FILE = "bus.credentials.json";
+
+export function joinCredentialsPath(stateDir: string): string {
+  return join(stateDir, JOIN_CREDENTIALS_FILE);
+}
+
+export function writeJoinCredentials(stateDir: string, creds: JoinCredentials): string {
+  mkdirSync(stateDir, { recursive: true });
+  const path = joinCredentialsPath(stateDir);
+  writeFileSync(path, JSON.stringify(creds, null, 2) + "\n", { mode: 0o600 });
+  return path;
+}
+
+export function readJoinCredentials(stateDir: string): JoinCredentials {
+  const j = JSON.parse(readFileSync(joinCredentialsPath(stateDir), "utf8")) as JoinCredentials;
+  if (
+    typeof j.bus_url !== "string" ||
+    typeof j.channel !== "string" ||
+    typeof j.epoch !== "string" ||
+    typeof j.participant !== "string" ||
+    !Array.isArray(j.participants) ||
+    !j.participants.includes(j.participant) ||
+    !Array.isArray(j.peers) ||
+    j.peers.includes(j.participant) ||
+    typeof j.token !== "string" ||
+    typeof j.channel_secret !== "string"
+  ) {
+    throw new Error(`malformed join credentials in ${joinCredentialsPath(stateDir)}`);
+  }
+  return j;
+}
+
+/**
+ * The join flow: redeem a one-time claim URL and persist the credentials
+ * (incl. the provisioned peer list) to `<stateDir>/bus.credentials.json`
+ * mode 0600. This is the ONLY thing the claim URL ever buys; it is dead
+ * after this call.
+ */
+export async function joinBusChat(
+  claimUrl: string,
+  stateDir: string
+): Promise<{ creds: JoinCredentials; path: string }> {
+  const got = await claimBusSecrets(claimUrl);
+  const creds: JoinCredentials = {
+    bus_url: got.busUrl,
+    channel: got.channel,
+    epoch: got.epoch,
+    participant: got.participant,
+    participants: got.participants,
+    peers: got.peers,
+    token: got.token,
+    channel_secret: got.secret,
+  };
+  const path = writeJoinCredentials(stateDir, creds);
+  return { creds, path };
+}
+
+/**
+ * Load a join state dir's credentials into ParticipantRuntime options.
+ * The runtime is pairwise: exactly one provisioned peer is required, and
+ * `peerId` always comes from the attested list — `over` is tunables only —
+ * so the runtime's peer check compares wire authorship against what
+ * provisioning actually attested, never against a hand-set value.
+ */
+export function participantOptionsFromJoin(
+  stateDir: string,
+  onTurn: TurnHandler,
+  over: Partial<Pick<ParticipantOptions, "replyTimeoutMs" | "pollWaitMs" | "fetchFn" | "hooks">> = {}
+): ParticipantOptions {
+  const creds = readJoinCredentials(stateDir);
+  if (creds.peers.length !== 1) {
+    throw new Error(
+      `pairwise runtime needs exactly one provisioned peer; ` +
+        `channel ${creds.channel} attests participants=${JSON.stringify(creds.participants)}`
+    );
+  }
+  return {
+    busUrl: creds.bus_url,
+    channel: creds.channel,
+    epoch: creds.epoch,
+    token: creds.token,
+    secret: creds.channel_secret,
+    agentId: creds.participant,
+    peerId: creds.peers[0],
+    stateDir,
+    onTurn,
+    ...over,
   };
 }
 
@@ -141,8 +287,11 @@ export function connectionInstructions(
     `paste ONLY this URL into chat with the ${agent.id} side — never the token or channel secret.`,
     `on the ${agent.id} machine, fetch it once and store the result in a 0600 file:`,
     `  curl -s ${claim.claim_url}`,
-    `  -> {"participant","token","channel_secret","channel","epoch"}`,
+    `  -> {"participant","participants","peers","token","channel_secret","channel","epoch"}`,
     `after this fetch the URL is dead; a leaked transcript copy is worthless.`,
+    `"peers" is provisioning's attestation of your peer id — it must read`,
+    `["${peerId}"]. if it doesn't, or a wire turn arrives authored by anyone`,
+    `else, the channel is mis-provisioned: abort, do not chat.`,
     ``,
     `operator's local copy of all secrets: bus.secret.json in the task dir (0600).`,
     ``,
@@ -194,4 +343,152 @@ export async function runBusChatSession(
     },
     opts
   );
+}
+
+export type BusTurnAdapter = "echo" | "cli" | "console";
+
+export interface BusRunOptions {
+  /** the local agent to drive — must be one of bus.participants */
+  agent: AgentConfig;
+  /** how turns are produced: scripted echo | spawn a cli agent | human console */
+  adapter?: BusTurnAdapter;
+  /** echo adapter: propose_close once this many accepted turns exist */
+  echoCloseAfter?: number;
+  /** cap the whole turn (incl. spawn) — a null result publishes "pass" */
+  replyTimeoutMs?: number;
+  /** per-request long-poll wait; default 1s */
+  pollWaitMs?: number;
+  /** durable participant state dir; default <task>/participant-<id>/ */
+  stateDir?: string;
+  /** console adapter I/O + idle timeout */
+  consoleIO?: ConsoleIO;
+  consoleTimeoutMs?: number;
+  /** transcript budget for the packed prompt; default from chat config */
+  historyBudgetChars?: number;
+  fetchFn?: FetchFn;
+  signal?: AbortSignal;
+  /** informational progress notes (adapter chosen, turn published, ...) */
+  onNote?: (s: string) => void;
+}
+
+export interface BusRunSummary {
+  agent: string;
+  ended: string | null;
+  /** accepted turns observed (including ours) when the run finished */
+  turns: number;
+}
+
+/** TranscriptTurn -> the normalized AcceptedTurn shape prompt packing takes. */
+const transcriptToAccepted = (t: TranscriptTurn): AcceptedTurn => ({
+  seq: t.seq,
+  actor: t.author,
+  in_reply_to: t.in_reply_to,
+  body: t.body,
+  signal: t.signal ?? "continue",
+  id: `seq-${t.seq}`,
+});
+
+/**
+ * Run one bus participant end-to-end: ParticipantRuntime owns the poll /
+ * outbox / retry loop; `adapter` picks how a turn's body+signal is produced.
+ * This is what `team bus-run <task> --as <agent>` wraps.
+ */
+export async function runBusParticipant(
+  bb: Blackboard,
+  config: TeamConfig,
+  meta: TaskMeta,
+  opts: BusRunOptions
+): Promise<BusRunSummary> {
+  const bus = meta.chat?.bus;
+  if (!bus) throw new Error(`task ${meta.id} has no bus provisioning`);
+  const agentId = opts.agent.id;
+  const peerId = bus.participants[0] === agentId ? bus.participants[1] : bus.participants[0];
+  if (!peerId || !bus.participants.includes(agentId)) {
+    throw new Error(`agent ${agentId} is not a participant of task ${meta.id}`);
+  }
+  const adapter: BusTurnAdapter =
+    opts.adapter ??
+    (opts.agent.adapter === "echo" ? "echo"
+      : opts.agent.kind === "cli" ? "cli"
+      : opts.agent.kind === "console" ? "console"
+      : "echo");
+
+  const secrets = readBusSecrets(bb, meta.id);
+  const token = secrets.tokens[agentId];
+  if (!token) throw new Error(`no bus token for ${agentId} in task ${meta.id}`);
+
+  const budget =
+    opts.historyBudgetChars ?? meta.chat?.history_budget_chars ?? config.chat.history_budget_chars;
+  const pack = (ctx: TurnContext): string =>
+    packChatPrompt({
+      config,
+      agent: opts.agent,
+      peerId,
+      topic: ctx.topic ?? meta.chat?.topic ?? bb.readArtifact(meta.id),
+      turns: ctx.transcript.map(transcriptToAccepted),
+      historyBudgetChars: budget,
+    }).prompt;
+
+  const closeAfter = Math.max(1, opts.echoCloseAfter ?? 4);
+  const onTurn: TurnHandler = async (ctx) => {
+    if (adapter === "echo") {
+      // scripted participant — lets a two-sided bus chat run with no runtime
+      const n = ctx.transcript.length + 1;
+      const answering = ctx.peerTurn
+        ? ` answering seq ${ctx.peerTurn.seq}: ${ctx.peerTurn.body.slice(0, 120)}`
+        : "";
+      return {
+        body: `[${agentId}] echo turn ${n}${answering}`,
+        signal: (ctx.transcript.length >= closeAfter ? "propose_close" : "continue") as ChatSignal,
+      };
+    }
+    const prompt = pack(ctx);
+    if (adapter === "cli") {
+      if (!opts.agent.command) {
+        throw new Error(`agent ${agentId} has kind=${opts.agent.kind} but no [agents.command]`);
+      }
+      const spec = buildSpawnSpec(opts.agent, config, prompt);
+      const out = await spawnAgent(spec, prompt, config);
+      const parsed = parseChatResult(out);
+      return { body: parsed.body, signal: parsed.signal };
+    }
+    // console adapter — same operator path as local chat
+    if (!opts.consoleIO) throw new Error("console adapter requires consoleIO");
+    const res = await consoleTurn(
+      opts.consoleIO,
+      agentId,
+      prompt,
+      opts.consoleTimeoutMs ?? meta.chat?.console_timeout_ms ?? config.chat.console_timeout_ms
+    );
+    if (!res.ok) {
+      return { body: `(operator cancelled: ${res.reason})`, signal: "abort" as ChatSignal };
+    }
+    return { body: res.body, signal: res.signal };
+  };
+
+  const stateDir = opts.stateDir ?? join(bb.taskDir(meta.id), `participant-${agentId}`);
+  mkdirSync(stateDir, { recursive: true });
+
+  const runtime = new ParticipantRuntime({
+    busUrl: bus.bus_url,
+    channel: bus.channel,
+    epoch: bus.epoch,
+    token,
+    secret: secrets.channel_secret,
+    agentId,
+    peerId,
+    stateDir,
+    onTurn,
+    replyTimeoutMs: opts.replyTimeoutMs,
+    pollWaitMs: opts.pollWaitMs,
+    fetchFn: opts.fetchFn,
+    hooks: {
+      onAcceptedTurn: (t: TranscriptTurn) =>
+        opts.onNote?.(`accepted turn seq=${t.seq} author=${t.author} signal=${t.signal ?? "continue"}`),
+      onPublish: (id: string, seq: number) => opts.onNote?.(`published ${id} seq=${seq}`),
+      onEnd: (reason: string) => opts.onNote?.(`chat ended: ${reason}`),
+    },
+  });
+  const res = await runtime.run(opts.signal);
+  return { agent: agentId, ended: res.ended, turns: res.turns };
 }

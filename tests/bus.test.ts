@@ -3,7 +3,7 @@
 // required relay semantics and liveness ownership.
 
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Blackboard } from "../src/blackboard.ts";
@@ -22,11 +22,18 @@ import {
   encodeStarted,
   encodeTurn,
   endedMsgId,
+  openingMsgId,
   type RelayMessage,
 } from "../src/bus/protocol.ts";
 import { runBusAuditor, type BusChatContext } from "../src/bus/auditor.ts";
-import { claimBusSecrets, connectionInstructions, provisionBusChat } from "../src/bus/session.ts";
-import { ParticipantRuntime } from "../src/bus/participant.ts";
+import {
+  claimBusSecrets,
+  connectionInstructions,
+  joinBusChat,
+  participantOptionsFromJoin,
+  provisionBusChat,
+} from "../src/bus/session.ts";
+import { ParticipantRuntime, PeerMismatchError } from "../src/bus/participant.ts";
 import { makeMeta } from "./helpers.ts";
 
 const T = 30_000;
@@ -135,9 +142,11 @@ async function waitFor(cond: () => boolean, what: string, ms = 8_000): Promise<v
 }
 
 const raws = (bb: Blackboard, id: string) =>
-  bb.readEvents(id).filter((e) => e.type === "bus_raw");
+  bb.readEvents(id).filter((e) => e.type === "bus_record");
 const turns = (bb: Blackboard, id: string) =>
-  bb.readEvents(id).filter((e) => e.type === "turn");
+  bb.readEvents(id).filter(
+    (e) => e.type === "bus_record" && e.verdict === "turn"
+  );
 
 describe("bus crypto", () => {
   test("AEAD envelope round-trips and rejects tampering", () => {
@@ -203,6 +212,11 @@ describe("onboarding claims", () => {
       expect(bundle.channel_secret).toBe(f.secret);
       expect(bundle.channel).toBe(f.ctx.channel);
       expect(bundle.epoch).toBe(f.ctx.epoch);
+      // the relay attests the participant list: the peer id comes from
+      // provisioning, never inferred from the first peer turn. The
+      // auditor's "orchestrator" author is not a chat participant.
+      expect(bundle.participants).toEqual(["a", "b"]);
+      expect(bundle.peers).toEqual(["b"]);
       // single-use: the claim is burned
       await expect(
         fetchClaim(`${f.relay.url}/c/${f.ctx.channel}/claim/${minted.claim_id}`)
@@ -213,6 +227,7 @@ describe("onboarding claims", () => {
         `${f.relay.url}/c/${f.ctx.channel}/claim/${mintedB.claim_id}`
       );
       expect(bundleB.token).toBe(f.tokens.b);
+      expect(bundleB.peers).toEqual(["a"]);
     } finally {
       f.relay.stop();
     }
@@ -263,8 +278,12 @@ describe("onboarding claims", () => {
       const prov = await provisionBusChat(f.relay.url, "adm-test", agents, { claimTtlMs: 120_000 });
       expect(Object.keys(prov.claims).sort()).toEqual(["a", "b"]);
       for (const id of ["a", "b"] as const) {
-        const text = connectionInstructions(prov, agents[id === "a" ? 0 : 1], id === "a" ? "b" : "a");
+        const peer = id === "a" ? "b" : "a";
+        const text = connectionInstructions(prov, agents[id === "a" ? 0 : 1], peer);
         expect(text).toContain(prov.claims[id].claim_url);
+        // every side's instructions name the provisioned peer explicitly
+        expect(text).toContain(`peer:       ${peer}`);
+        expect(text).toContain(`["${peer}"]`);
         // the long-lived credentials must not appear in what the operator pastes
         expect(text).not.toContain(prov.tokens[id]);
         expect(text).not.toContain(prov.secret);
@@ -274,6 +293,43 @@ describe("onboarding claims", () => {
       expect(got.participant).toBe("a");
       expect(got.token).toBe(prov.tokens.a);
       expect(got.secret).toBe(prov.secret);
+      expect(got.peers).toEqual(["b"]);
+    } finally {
+      f.relay.stop();
+    }
+  });
+
+  test("join persists the provisioned peer id next to the credentials (0600)", async () => {
+    const f = await setupBus("t-join");
+    try {
+      const agents = [
+        { id: "a", kind: "bus", bus_url: f.relay.url },
+        { id: "b", kind: "bus", bus_url: f.relay.url },
+      ] as Parameters<typeof provisionBusChat>[2];
+      const prov = await provisionBusChat(f.relay.url, "adm-test", agents, {});
+      const dir = join(f.dir, "join-a");
+      const { creds, path } = await joinBusChat(prov.claims.a.claim_url, dir);
+      expect(creds.participant).toBe("a");
+      expect(creds.peers).toEqual(["b"]);
+      expect(creds.channel).toBe(prov.channel);
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+      // the attested identity is on disk beside the token + secret
+      const onDisk = JSON.parse(readFileSync(path, "utf8"));
+      expect(onDisk).toMatchObject({
+        participant: "a",
+        participants: ["a", "b"],
+        peers: ["b"],
+        token: prov.tokens.a,
+        channel_secret: prov.secret,
+      });
+      // runtime options take the peer from the attested file, not a flag
+      const opts = participantOptionsFromJoin(dir, async () => ({ body: "x" }));
+      expect(opts.agentId).toBe("a");
+      expect(opts.peerId).toBe("b");
+      // the burned claim cannot onboard twice
+      await expect(
+        joinBusChat(prov.claims.a.claim_url, join(f.dir, "join-a2"))
+      ).rejects.toThrow(/no such claim/);
     } finally {
       f.relay.stop();
     }
@@ -293,7 +349,7 @@ describe("bus auditor", () => {
       });
       // opening control committed before any turn is valid
       await waitFor(
-        () => f.bb.readEvents(f.meta.id).some((e) => e.type === "chat_started"),
+        () => f.bb.readEvents(f.meta.id).some((e) => e.type === "bus_record" && e.verdict === "control_started"),
         "opening committed"
       );
 
@@ -349,11 +405,19 @@ describe("bus auditor", () => {
         stateDir: join(f.dir, `p-${id}`),
         pollWaitMs: 30,
         replyTimeoutMs: 2_000,
-        onTurn: async (ctx) => ({
-          body: `[${id}] turn answering ${ctx.peerTurn ? `seq ${ctx.peerTurn.seq}` : "the opening"}`,
-          // b aborts once both sides have spoken twice -> auditor ends it
-          signal: ctx.transcript.length >= 3 ? "abort" : "continue",
-        }),
+        onTurn: async (ctx) => {
+          // pace the scripted ping-pong: turns published faster than the
+          // auditor can decide+land a chat_ended get locally accepted past
+          // its terminal_seq, and the validator then ignores the close as
+          // stale_ended. Real turns take seconds; a small delay keeps the
+          // scripted run inside the envelope the protocol was designed for.
+          await new Promise((r) => setTimeout(r, 25));
+          return {
+            body: `[${id}] turn answering ${ctx.peerTurn ? `seq ${ctx.peerTurn.seq}` : "the opening"}`,
+            // b aborts once both sides have spoken twice -> auditor ends it
+            signal: ctx.transcript.length >= 3 ? "abort" : "continue",
+          };
+        },
       });
     try {
       const auditorDone = runBusAuditor(
@@ -388,6 +452,87 @@ describe("bus auditor", () => {
     }
   }, T);
 
+  test("peer attestation: a wire turn authored by a non-provisioned peer aborts loudly", async () => {
+    const f = await setupBus("t-peermismatch");
+    const ctl = new AbortController();
+    try {
+      // mis-provisioning: b's runtime believes its peer is "carol", but the
+      // channel actually pairs b with a. The first wire turn authored by a
+      // is positive proof of the disagreement — the runtime aborts rather
+      // than ignore it as not_participant and hang (or chat on).
+      let produced = 0;
+      const mkB = () =>
+        new ParticipantRuntime({
+          busUrl: f.relay.url, channel: f.ctx.channel, epoch: f.ctx.epoch,
+          token: f.tokens.b, secret: f.secret, agentId: "b", peerId: "carol",
+          stateDir: join(f.dir, "p-b"), pollWaitMs: 30, replyTimeoutMs: 60_000,
+          onTurn: async () => { produced++; return { body: "must never be produced" }; },
+        });
+      const pb = mkB();
+      const running = pb.run(ctl.signal).then(() => null, (e) => e);
+      await f.clients.orchestrator.publish(
+        openingMsgId(f.ctx.epoch), encodeStarted("a", "topic")
+      );
+      await f.clients.a.publish("a@e-test1:re0", encodeTurn(null, "a opens"));
+      const err = await running;
+      expect(err).toBeInstanceOf(PeerMismatchError);
+      expect((err as Error).message).toContain('"carol"');
+      expect((err as Error).message).toContain('"a"');
+      expect(produced).toBe(0);
+      // the offending message was never committed to the seen set: a
+      // restarted runtime re-encounters it and aborts again
+      const err2 = await mkB().run(ctl.signal).then(() => null, (e) => e);
+      expect(err2).toBeInstanceOf(PeerMismatchError);
+      // nothing was ever published under b's authorship
+      expect(
+        f.relay.channel(f.ctx.channel)!.messages.filter((m) => m.author === "b")
+      ).toHaveLength(0);
+    } finally {
+      ctl.abort();
+      f.relay.stop();
+    }
+  }, T);
+
+  test("peer attestation: the provisioned peer's turns pass the check", async () => {
+    const f = await setupBus("t-peerok");
+    const ctl = new AbortController();
+    try {
+      // a's runtime was provisioned with peer "b" — b's wire turn matches,
+      // so the run proceeds and a answers (happy path unaffected).
+      const pa = new ParticipantRuntime({
+        busUrl: f.relay.url, channel: f.ctx.channel, epoch: f.ctx.epoch,
+        token: f.tokens.a, secret: f.secret, agentId: "a", peerId: "b",
+        stateDir: join(f.dir, "p-a"), pollWaitMs: 30, replyTimeoutMs: 60_000,
+        onTurn: async (ctx) => ({
+          body: `a answers ${ctx.peerTurn ? `seq ${ctx.peerTurn.seq}` : "the opening"}`,
+          signal: ctx.peerTurn ? "abort" : "continue",
+        }),
+      });
+      const running = pa.run(ctl.signal).then(() => null, (e) => e);
+      await f.clients.orchestrator.publish(
+        openingMsgId(f.ctx.epoch), encodeStarted("b", "topic")
+      );
+      await waitFor(() => pa.cursor >= 1, "opening observed");
+      // b is named first speaker; its turn is authored by the provisioned peer
+      await f.clients.b.publish("b@e-test1:re0", encodeTurn(null, "b opens"));
+      // a observes b's turn (no abort), then answers — and its abort signal
+      // ends the run once the auditor-side control... no auditor here; the
+      // abort signal in a's turn doesn't end anything without the auditor,
+      // so wait for a's reply to land, then stop the run.
+      await waitFor(
+        () => f.relay.channel(f.ctx.channel)!.messages.some((m) => m.author === "a"),
+        "a answered the provisioned peer"
+      );
+      ctl.abort();
+      const res = await running;
+      expect(res).toBeNull(); // no error surfaced — the run ended by abort signal
+      expect(pa.transcript.map((t) => t.author)).toEqual(["b", "a"]);
+    } finally {
+      ctl.abort();
+      f.relay.stop();
+    }
+  }, T);
+
   test("idle timeout: auditor publishes chat_ended{idle_timeout}; post-close turns are raw-only", async () => {
     const f = await setupBus("t-idle");
     try {
@@ -397,7 +542,7 @@ describe("bus auditor", () => {
       });
       // opening control committed before any turn is valid
       await waitFor(
-        () => f.bb.readEvents(f.meta.id).some((e) => e.type === "chat_started"),
+        () => f.bb.readEvents(f.meta.id).some((e) => e.type === "bus_record" && e.verdict === "control_started"),
         "opening committed"
       );
       // one accepted turn moves the chat into the post-first-turn regime
@@ -412,7 +557,13 @@ describe("bus auditor", () => {
       const ch = f.relay.channel(f.ctx.channel)!;
       const ctrl = ch.messages.find((m) => m.msg_id === ended.bus!.msg_id)!;
       expect(ctrl.author).toBe("orchestrator");
-      expect(ctrl.seq).toBe(ended.bus!.seq);
+      // the committed chat_ended is a local decision record (seq=0); the wire
+      // copy's relay seq lives on its own bus_record
+      expect(ended.bus!.seq).toBe(0);
+      const wireEnd = raws(f.bb, f.meta.id).find(
+        (e) => e.bus!.msg_id === ended.bus!.msg_id
+      )!;
+      expect(wireEnd.bus!.seq).toBe(ctrl.seq);
 
       // a post-close turn lands after the end: raw only, never accepted
       await f.clients.a.publish("a-late", encodeTurn(null, "too late"));
@@ -460,7 +611,7 @@ describe("bus auditor", () => {
       });
       // opening control committed before any turn is valid
       await waitFor(
-        () => f.bb.readEvents(f.meta.id).some((e) => e.type === "chat_started"),
+        () => f.bb.readEvents(f.meta.id).some((e) => e.type === "bus_record" && e.verdict === "control_started"),
         "opening committed"
       );
       await f.clients.a.publish("a-turn-1", encodeTurn(null, "a opens"));
@@ -491,7 +642,7 @@ describe("bus auditor", () => {
       });
       // opening control committed before any turn is valid
       await waitFor(
-        () => f.bb.readEvents(f.meta.id).some((e) => e.type === "chat_started"),
+        () => f.bb.readEvents(f.meta.id).some((e) => e.type === "bus_record" && e.verdict === "control_started"),
         "opening committed"
       );
       await f.clients.a.publish("a-turn-1", encodeTurn(null, "a opens"));
@@ -569,7 +720,7 @@ describe("bus auditor", () => {
         { idleTimeoutMs: 10_000, pollWaitMs: 30, signal: ctl1.signal }
       );
       await waitFor(
-        () => f.bb.readEvents(f.meta.id).some((e) => e.type === "chat_started"),
+        () => f.bb.readEvents(f.meta.id).some((e) => e.type === "bus_record" && e.verdict === "control_started"),
         "opening committed"
       );
       await f.clients.a.publish("a@e-test1:re0", encodeTurn(null, "a turn one"));
@@ -673,7 +824,7 @@ describe("bus client resilience", () => {
     // Regression: a proxy/dropped connection can hand poll() a non-OK
     // response whose body parses as JSON null. readBody must normalize it
     // to {} so the rejection path reads body.error safely.
-    const nullBodyFetch = (async () =>
+    const nullBodyFetch = (async (_url: unknown, _init: unknown) =>
       new Response("null", { status: 502, headers: { "content-type": "application/json" } })
     ) as FetchFn;
     const client = new BusClient({

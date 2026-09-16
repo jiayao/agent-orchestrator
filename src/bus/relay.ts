@@ -311,6 +311,10 @@ export function startRelay(opts: { port?: number; adminToken: string }): RelayHa
 
       // Claim redemption: unauthenticated, single-use. Burn the claim before
       // responding so a concurrent double-fetch cannot both succeed.
+      // The response also attests the channel's participant list — the
+      // redeemer learns its peer id from provisioning instead of inferring
+      // it from the first peer turn (participants = token authors minus the
+      // reserved "orchestrator" auditor author).
       const claimMatch = /^\/c\/([A-Za-z0-9_-]{1,128})\/claim\/([A-Za-z0-9_-]{1,128})$/.exec(path);
       if (claimMatch && method === "GET") {
         const ch = channels.get(claimMatch[1]);
@@ -321,12 +325,15 @@ export function startRelay(opts: { port?: number; adminToken: string }): RelayHa
         if (Date.now() >= claim.expiresAt) {
           return json({ error: "claim expired" }, 410);
         }
+        const participants = [...ch.tokens.values()].filter((a) => a !== "orchestrator");
         console.log(
           `[relay] claim redeemed channel=${ch.id} participant=${claim.participant} ` +
             `token_fp=${tokenFingerprint(claim.token)}`
         );
         return json({
           participant: claim.participant,
+          participants,
+          peers: participants.filter((a) => a !== claim.participant),
           token: claim.token,
           channel_secret: claim.secret,
           channel: ch.id,

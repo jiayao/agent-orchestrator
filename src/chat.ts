@@ -10,17 +10,32 @@ import type {
   ChatEndReason,
   ChatSignal,
   RunResult,
-  SpawnOutcome,
   TaskMeta,
   TeamConfig,
   TeamEvent,
 } from "./types.ts";
 import { Blackboard } from "./blackboard.ts";
 import { checkBudget } from "./runner.ts";
-import { applyRedaction, buildSpawnSpec, estimatedCost, spawnAgent } from "./spawn.ts";
+import {
+  applyRedaction,
+  buildSpawnSpec,
+  estimatedCost,
+  spawnAgent,
+  type SpawnOutcome,
+} from "./spawn.ts";
 import { resolveFinalBody } from "./envelope.ts";
+import {
+  CHARS_PER_TOKEN,
+  closePending,
+  closingTurnCommitted,
+  endCondition,
+  estTokens,
+  expectedActor,
+  substantiveCount,
+  transcriptFor,
+  type AcceptedTurn,
+} from "./chatcore.ts";
 
-const CHARS_PER_TOKEN = 4;
 const COMPLETION_RESERVE_TOKENS = 512;
 
 const CHAT_CONTRACT = `CHAT TURN CONTRACT (mandatory):
@@ -48,9 +63,19 @@ export function isChatSignal(v: unknown): v is ChatSignal {
   return typeof v === "string" && (CHAT_SIGNALS as string[]).includes(v);
 }
 
-/** Estimated tokens for a string (chars/4). */
-export function estTokens(s: string): number {
-  return Math.ceil(s.length / CHARS_PER_TOKEN);
+export { estTokens } from "./chatcore.ts";
+
+/** Normalize a committed local "turn" event into the shared AcceptedTurn shape. */
+export function turnEventToAccepted(ev: TeamEvent): AcceptedTurn {
+  return {
+    seq: ev.seq,
+    actor: ev.actor,
+    in_reply_to: null,
+    body: ev.body,
+    signal: ev.signal ?? "continue",
+    malformed: ev.malformed,
+    id: ev.event_id,
+  };
 }
 
 /**
@@ -112,6 +137,7 @@ export interface ChatProgress {
 export function chatProgress(events: TeamEvent[], agentIds: [string, string]): ChatProgress {
   const turns = events.filter((e) => e.type === "turn");
   const lastTurn = turns[turns.length - 1];
+  const accepted = turns.map(turnEventToAccepted);
   // a chat_ended with reason=cancelled is a suspension point (resumable),
   // not a terminal end — only non-cancelled ends close the derivation
   const ended = events.some(
@@ -125,15 +151,20 @@ export function chatProgress(events: TeamEvent[], agentIds: [string, string]): C
       break;
     }
   }
-  const substantive = turns.filter((t) => t.signal !== "pass").length;
-  const closePending = lastTurn?.signal === "propose_close";
-  const closingTurnCommitted =
-    turns.length >= 2 && turns[turns.length - 2].signal === "propose_close";
-  let nextActor: string;
-  if (pending) nextActor = pending.actor;
-  else if (!lastTurn) nextActor = agentIds[0];
-  else nextActor = lastTurn.actor === agentIds[0] ? agentIds[1] : agentIds[0];
-  return { turns, lastTurn, ended, pending, substantive, closePending, closingTurnCommitted, nextActor };
+  const substantive = substantiveCount(accepted);
+  const nextActor = pending
+    ? pending.actor
+    : expectedActor(accepted, agentIds, agentIds[0]);
+  return {
+    turns,
+    lastTurn,
+    ended,
+    pending,
+    substantive,
+    closePending: closePending(accepted),
+    closingTurnCommitted: closingTurnCommitted(accepted),
+    nextActor,
+  };
 }
 
 export interface PackedChatPrompt {
@@ -153,7 +184,7 @@ export function packChatPrompt(input: {
   agent: AgentConfig;
   peerId: string;
   topic: string;
-  turns: TeamEvent[];
+  turns: AcceptedTurn[];
   historyBudgetChars: number;
 }): PackedChatPrompt {
   const { config, agent } = input;
@@ -174,34 +205,15 @@ export function packChatPrompt(input: {
     `one TEAM_RESULT_V1 envelope carrying your body and signal.`;
 
   const budgetTokens = Math.max(0, Math.floor(input.historyBudgetChars / CHARS_PER_TOKEN));
-  let avail = budgetTokens - estTokens(seed) - estTokens(tail) - COMPLETION_RESERVE_TOKENS;
-
-  const rendered = input.turns.map(
-    (t) =>
-      `[${t.event_id}] ${t.actor} (signal=${t.signal ?? "continue"}${t.malformed ? " malformed" : ""})\n${t.body}`
-  );
-  const keep: string[] = [];
-  let drop = 0;
-  for (let i = rendered.length - 1; i >= 0; i--) {
-    const cost = estTokens(rendered[i]);
-    if (cost > avail) {
-      drop = i + 1;
-      break;
-    }
-    avail -= cost;
-    keep.unshift(rendered[i]);
-  }
-
-  const omitted =
-    drop > 0
-      ? { first: input.turns[0].event_id, last: input.turns[drop - 1].event_id, count: drop }
-      : null;
+  const avail = budgetTokens - estTokens(seed) - estTokens(tail) - COMPLETION_RESERVE_TOKENS;
+  const slice = transcriptFor(input.turns, avail);
+  const omitted = slice.omitted;
 
   const parts = [seed, "", "TRANSCRIPT SO FAR (whole turns only; ids are stable):", ""];
   if (omitted) {
     parts.push(`[orchestrator: ${omitted.count} oldest turn(s) omitted, events ${omitted.first}..${omitted.last}]`, "");
   }
-  if (keep.length) parts.push(keep.join("\n\n"));
+  if (slice.kept.length) parts.push(slice.kept.join("\n\n"));
   else if (!omitted) parts.push("(no prior turns)");
   parts.push("", tail);
   return { prompt: parts.join("\n"), omitted };
@@ -245,7 +257,7 @@ type ConsoleAnswer = { ok: true; body: string; signal: ChatSignal } | { ok: fals
  * EOF, TTY loss, or interrupt the uncommitted input is discarded and the
  * caller ends the chat cancelled.
  */
-async function consoleTurn(
+export async function consoleTurn(
   io: ConsoleIO,
   actorId: string,
   promptText: string,
@@ -399,19 +411,9 @@ export async function runChat(
         total_turns: meta.chat?.total_turns ?? prog.turns.length,
       };
     }
-    if (prog.lastTurn?.signal === "abort") {
-      return finish("aborted", `abort signaled by ${prog.lastTurn.actor}`);
-    }
-    if (prog.closingTurnCommitted) {
-      return finish(
-        "agreed",
-        `close proposed by ${prog.turns[prog.turns.length - 2].actor}; ` +
-          `closing turn by ${prog.lastTurn!.actor}`
-      );
-    }
-    if (!prog.closePending && prog.substantive >= maxTurns) {
-      return finish("expired", `max_turns=${maxTurns} reached`);
-    }
+    const accepted = prog.turns.map(turnEventToAccepted);
+    const end = endCondition(accepted, maxTurns);
+    if (end) return finish(end.reason, end.detail);
 
     const actorId = prog.nextActor;
     const agent = agents.find((a) => a.id === actorId);
@@ -438,7 +440,7 @@ export async function runChat(
       agent,
       peerId,
       topic: meta.chat!.topic,
-      turns: prog.turns,
+      turns: accepted,
       historyBudgetChars,
     });
     if (pack.omitted) {

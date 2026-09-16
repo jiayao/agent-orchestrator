@@ -61,6 +61,8 @@ Relay endpoints (bearer auth; `POST /admin/*` takes the admin token):
 
 - `POST /admin/channels` — provision `{channel, epoch, tokens: {author: token}}`; requires an `orchestrator` author.
 - `DELETE /admin/channels/<channel>/tokens/<author>` — revoke a participant.
+- `POST /admin/channels/<channel>/claims` — mint a single-use onboarding claim `{participant, channel_secret, ttl_ms?}` (admin-only; the relay holds the secret in memory only until redeem/expiry).
+- `GET /c/<channel>/claim/<id>` — redeem a claim once: returns `{participant, participants, peers, token, channel_secret, channel, epoch}`, then the claim is dead (second fetch 410, expired 410). `peers` is provisioning's attestation of the peer id — `team join --from-claim-url` persists the bundle to `bus.credentials.json` (0600), and the participant runtime aborts loudly if a wire turn arrives authored by anyone else.
 - `POST /c/<channel>/messages` — publish; a retried `msg_id` returns the original `seq` (`deduped: true`) and never appends twice.
 - `GET /c/<channel>/messages?since=<seq>&wait=<ms>` — long-poll; returns `{messages, latest}`.
 - `POST /c/<channel>/auditor` — take the auditor lease; one per channel, a second author gets 409.
@@ -158,6 +160,7 @@ for omp (its ~110s practical ceiling) — see `examples/team.toml`.
 - `team verdict <task-id> good|bad|mixed [note]` — record the realized outcome to the task + taste log
 - `team chat --agents a,b --topic "..."` — pairwise dialogue; `--resume <task-id>` re-prompts the last committed actor. With `kind = "bus"` agents it provisions a relay channel and starts the auditor instead
 - `team bus-serve [--port 8787]` — local in-memory message-bus relay for development
+- `team join --from-claim-url <url> [--state-dir dir]` — redeem a one-time claim URL; persists `bus.credentials.json` (0600) with the token, channel secret, and the provisioned peer id
 - `team export <task-id> [--out path]` — deterministic JSON bundle: inputs, events, decisions, run metrics
 
 Global flags: `--json` (machine-readable output on every command),

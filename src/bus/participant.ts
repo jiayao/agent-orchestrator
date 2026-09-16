@@ -2,6 +2,15 @@
 // and documented for grok's loop. Each participant is a symmetric bus peer:
 // it publishes its own turns and subscribes to the peer's.
 //
+// Peer identity is provisioned, not inferred: `peerId` comes from
+// provisioning (the claim's attested participant list, or the operator's
+// own bus.secret.json path). Any wire turn whose relay-attested author is
+// neither us nor that provisioned peer means the channel is not the one we
+// were provisioned into — the runtime aborts loudly rather than continue a
+// mis-provisioned chat. This check is exactly as strong as the relay's
+// authorship attestation (crash-faults-only trust model) — it detects
+// provisioning/wire disagreement, not a Byzantine relay.
+//
 // Discipline (all durable, all crash-safe):
 // - the inbound cursor advances only after the message's effects are
 //   committed to the state file (the pending-reply record IS the effect for
@@ -31,12 +40,36 @@ import {
   type BusPayload,
   type RelayMessage,
 } from "./protocol.ts";
+import { expectedActor, type AcceptedTurn } from "../chatcore.ts";
+
+/**
+ * Thrown when a wire turn's relay-attested author is neither this
+ * participant nor the provisioned peer: the channel's live authorship
+ * disagrees with what provisioning attested — a mis-provisioned channel.
+ * Fatal to the run, not a transcript event: the process aborts loudly.
+ */
+export class PeerMismatchError extends Error {
+  constructor(
+    readonly channel: string,
+    readonly expected: string,
+    readonly observed: string,
+    readonly seq: number
+  ) {
+    super(
+      `peer mismatch on ${channel}: provisioned peer is "${expected}" but ` +
+        `a turn arrived authored by "${observed}" (seq=${seq}) — ` +
+        `mis-provisioned channel, aborting`
+    );
+    this.name = "PeerMismatchError";
+  }
+}
 
 export interface TranscriptTurn {
   seq: number;
   author: string;
   in_reply_to: number | null;
   body: string;
+  signal?: ChatSignal;
 }
 
 export interface TurnContext {
@@ -93,6 +126,10 @@ interface AwaitingEntry {
 }
 
 interface ParticipantState {
+  /** the channel + epoch this state file belongs to — a mismatch on load
+   *  resets to a fresh state rather than inheriting another chat's cursor */
+  channel?: string;
+  epoch?: string;
   cursor: number;
   /** durable seen-msg_id set — idempotent at-least-once processing */
   seen: string[];
@@ -141,9 +178,35 @@ export class ParticipantRuntime {
   }
 
   private load(): ParticipantState {
+    const fresh = (): ParticipantState => ({
+      channel: this.opts.channel,
+      epoch: this.opts.epoch,
+      cursor: 0,
+      seen: [],
+      own: [],
+      transcript: [],
+      firstSpeaker: null,
+      expected: null,
+      lastAcceptedSeq: null,
+      pendingPeerSeq: null,
+      outbox: [],
+      awaiting: null,
+      ended: null,
+    });
     try {
       const j = JSON.parse(readFileSync(this.statePath, "utf8")) as ParticipantState;
+      // the state file is bound to {channel, epoch}: a re-provisioned chat
+      // must not inherit the old cursor/ended state
+      if (j.channel !== this.opts.channel || j.epoch !== this.opts.epoch) {
+        process.stderr.write(
+          `bus-participant: state file belongs to channel=${j.channel} epoch=${j.epoch} ` +
+            `(this run: ${this.opts.channel}/${this.opts.epoch}) — starting fresh\n`
+        );
+        return fresh();
+      }
       return {
+        channel: j.channel,
+        epoch: j.epoch,
         cursor: j.cursor ?? 0,
         seen: j.seen ?? [],
         own: j.own ?? [],
@@ -157,19 +220,7 @@ export class ParticipantRuntime {
         ended: j.ended ?? null,
       };
     } catch {
-      return {
-        cursor: 0,
-        seen: [],
-        own: [],
-        transcript: [],
-        firstSpeaker: null,
-        expected: null,
-        lastAcceptedSeq: null,
-        pendingPeerSeq: null,
-        outbox: [],
-        awaiting: null,
-        ended: null,
-      };
+      return fresh();
     }
   }
 
@@ -234,6 +285,21 @@ export class ParticipantRuntime {
       }
 
       const own = m.author === this.opts.agentId;
+
+      // Provisioning attestation, checked on the raw wire author BEFORE the
+      // turn validator: a turn authored by anyone but us or the provisioned
+      // peer is not merely protocol-invalid (the validator would ignore it
+      // as not_participant and we'd hang) — it is positive evidence the
+      // channel is not what we were provisioned into. Abort loudly; the
+      // message is deliberately left unprocessed/unpersisted so a restart
+      // re-encounters it and aborts again rather than silently advancing
+      // past the disagreement.
+      if (payload?.type === "turn" && !own && m.author !== this.opts.peerId) {
+        const err = new PeerMismatchError(this.opts.channel, this.opts.peerId, m.author, m.seq);
+        process.stderr.write(`bus-participant: ${err.message}\n`);
+        throw err;
+      }
+
       const v = this.validator.ingest({ seq: m.seq, author: m.author }, payload);
 
       if (payload?.type === "control") {
@@ -251,6 +317,7 @@ export class ParticipantRuntime {
           author: m.author,
           in_reply_to: payload.in_reply_to,
           body: payload.body,
+          signal: payload.signal ?? "continue",
         };
         s.transcript.push(t);
         if (s.transcript.length > TRANSCRIPT_CAP) {
@@ -330,6 +397,24 @@ export class ParticipantRuntime {
   }
 
   /**
+   * Whose turn is it — derived from the accepted-turn transcript through the
+   * shared rule (chatcore.expectedActor); the same fold the validator applies
+   * incrementally. Null until the opening control names a first speaker.
+   */
+  private expectedSpeaker(): string | null {
+    const s = this.state;
+    if (s.firstSpeaker === null) return null;
+    const turns: AcceptedTurn[] = s.transcript.map((t) => ({
+      seq: t.seq,
+      actor: t.author,
+      in_reply_to: t.in_reply_to,
+      body: t.body,
+      signal: t.signal ?? "continue",
+    }));
+    return expectedActor(turns, this.validator.participants, s.firstSpeaker);
+  }
+
+  /**
    * Wakeup: if the deterministic rule says it is our turn, produce a reply.
    * Pre-publish staleness check: re-read the relay first and drop the turn
    * if a newer message (peer turn or control) made it stale.
@@ -338,13 +423,13 @@ export class ParticipantRuntime {
     const s = this.state;
     if (s.ended) return;
     const myTurn =
-      this.validator.expected === this.opts.agentId &&
+      this.expectedSpeaker() === this.opts.agentId &&
       (s.pendingPeerSeq !== null || this.validator.lastAcceptedSeq === null);
     if (!myTurn) return;
 
     // staleness check — catch up on anything newer before composing
     await this.fetchOnce(0);
-    if (s.ended || this.validator.expected !== this.opts.agentId) return;
+    if (s.ended || this.expectedSpeaker() !== this.opts.agentId) return;
 
     const peerTurn =
       s.pendingPeerSeq !== null
@@ -365,7 +450,7 @@ export class ParticipantRuntime {
     // second staleness check — the handler may have taken a while; drop a
     // reply made stale by a message that arrived while we composed it
     await this.fetchOnce(0);
-    if (s.ended || this.validator.expected !== this.opts.agentId) return;
+    if (s.ended || this.expectedSpeaker() !== this.opts.agentId) return;
     if (inReplyTo !== null && s.pendingPeerSeq !== inReplyTo) return;
 
     const msgId = turnMsgId(this.opts.agentId, this.opts.epoch, inReplyTo);
@@ -423,6 +508,8 @@ export class ParticipantRuntime {
       try {
         await this.fetchOnce(this.nextWait(pollWaitMs));
       } catch (e) {
+        // a provisioning violation is fatal, not retriable — let it abort
+        if (e instanceof PeerMismatchError) throw e;
         const status = (e as BusError).status;
         if (status === 401 || status === 404) throw e;
         await sleep(Math.min(250, pollWaitMs));
