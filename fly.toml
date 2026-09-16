@@ -2,8 +2,11 @@ app = "agent-bus-relay"
 primary_region = "lax"
 
 # The relay is in-memory: one machine only (two machines = two separate
-# channel logs = a fork), and autostop off (a stop wipes every channel,
-# token, and message; chats must then be re-provisioned).
+# channel logs = a fork; Fly's proxy round-robins between them). After
+# `fly launch` (which creates two machines by default), run:
+#     fly scale count 1
+# Autostop is off: a stop wipes every channel, token, and message; chats
+# must then be re-provisioned.
 [http_service]
   internal_port = 8787
   force_https = true
