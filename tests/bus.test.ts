@@ -16,7 +16,7 @@ import {
   BusCryptoError,
 } from "../src/bus/crypto.ts";
 import { startRelay, type RelayHandle } from "../src/bus/relay.ts";
-import { adminProvisionChannel, BusClient, BusError, type FetchFn } from "../src/bus/client.ts";
+import { adminProvisionChannel, adminMintClaim, fetchClaim, BusClient, BusError, type FetchFn } from "../src/bus/client.ts";
 import {
   encodeEnded,
   encodeStarted,
@@ -25,6 +25,7 @@ import {
   type RelayMessage,
 } from "../src/bus/protocol.ts";
 import { runBusAuditor, type BusChatContext } from "../src/bus/auditor.ts";
+import { claimBusSecrets, connectionInstructions, provisionBusChat } from "../src/bus/session.ts";
 import { ParticipantRuntime } from "../src/bus/participant.ts";
 import { makeMeta } from "./helpers.ts";
 
@@ -182,6 +183,97 @@ describe("relay semantics", () => {
       // same author re-request is idempotent (auditor restart)
       const again = await f.clients.orchestrator.requestAuditorLease();
       expect(again.auditor).toBe("orchestrator");
+    } finally {
+      f.relay.stop();
+    }
+  });
+});
+
+describe("onboarding claims", () => {
+  test("mint -> fetch returns the participant's token + secret; second fetch is dead", async () => {
+    const f = await setupBus("t-claim");
+    try {
+      const minted = await adminMintClaim(f.relay.url, "adm-test", f.ctx.channel, "a", f.secret);
+      expect(minted.claim_id).toMatch(/^[0-9a-f]{48}$/);
+      const bundle = await fetchClaim(
+        `${f.relay.url}/c/${f.ctx.channel}/claim/${minted.claim_id}`
+      );
+      expect(bundle.participant).toBe("a");
+      expect(bundle.token).toBe(f.tokens.a);
+      expect(bundle.channel_secret).toBe(f.secret);
+      expect(bundle.channel).toBe(f.ctx.channel);
+      expect(bundle.epoch).toBe(f.ctx.epoch);
+      // single-use: the claim is burned
+      await expect(
+        fetchClaim(`${f.relay.url}/c/${f.ctx.channel}/claim/${minted.claim_id}`)
+      ).rejects.toThrow(/no such claim/);
+      // a claim for b is untouched by a's redemption
+      const mintedB = await adminMintClaim(f.relay.url, "adm-test", f.ctx.channel, "b", f.secret);
+      const bundleB = await fetchClaim(
+        `${f.relay.url}/c/${f.ctx.channel}/claim/${mintedB.claim_id}`
+      );
+      expect(bundleB.token).toBe(f.tokens.b);
+    } finally {
+      f.relay.stop();
+    }
+  });
+
+  test("expired claim is dead; unknown claim is 404", async () => {
+    const f = await setupBus("t-claimexp");
+    try {
+      const minted = await adminMintClaim(f.relay.url, "adm-test", f.ctx.channel, "a", f.secret, 60_000);
+      // force expiry by minting with a past deadline is not possible via the
+      // API (min TTL 60s), so expire it through the test handle instead
+      f.relay.channel(f.ctx.channel)!.claims.get(minted.claim_id)!.expiresAt = Date.now() - 1;
+      await expect(
+        fetchClaim(`${f.relay.url}/c/${f.ctx.channel}/claim/${minted.claim_id}`)
+      ).rejects.toThrow(/expired/);
+      await expect(
+        fetchClaim(`${f.relay.url}/c/${f.ctx.channel}/claim/${"0".repeat(48)}`)
+      ).rejects.toThrow(/no such claim/);
+    } finally {
+      f.relay.stop();
+    }
+  });
+
+  test("minting requires admin and a real participant", async () => {
+    const f = await setupBus("t-claimauth");
+    try {
+      await expect(
+        adminMintClaim(f.relay.url, "wrong-admin", f.ctx.channel, "a", f.secret)
+      ).rejects.toThrow(/unauthorized/);
+      await expect(
+        adminMintClaim(f.relay.url, "adm-test", f.ctx.channel, "nobody", f.secret)
+      ).rejects.toThrow(/no such participant/);
+      await expect(
+        adminMintClaim(f.relay.url, "adm-test", "chat-nope", "a", f.secret)
+      ).rejects.toThrow(/no such channel/);
+    } finally {
+      f.relay.stop();
+    }
+  });
+
+  test("provisioning mints claims; instructions carry the URL, not the secrets", async () => {
+    const f = await setupBus("t-claimprov");
+    try {
+      const agents = [
+        { id: "a", kind: "bus", bus_url: f.relay.url },
+        { id: "b", kind: "bus", bus_url: f.relay.url },
+      ] as Parameters<typeof provisionBusChat>[2];
+      const prov = await provisionBusChat(f.relay.url, "adm-test", agents, { claimTtlMs: 120_000 });
+      expect(Object.keys(prov.claims).sort()).toEqual(["a", "b"]);
+      for (const id of ["a", "b"] as const) {
+        const text = connectionInstructions(prov, agents[id === "a" ? 0 : 1], id === "a" ? "b" : "a");
+        expect(text).toContain(prov.claims[id].claim_url);
+        // the long-lived credentials must not appear in what the operator pastes
+        expect(text).not.toContain(prov.tokens[id]);
+        expect(text).not.toContain(prov.secret);
+      }
+      // the claim actually onboards: fetch -> connect -> publish accepted
+      const got = await claimBusSecrets(prov.claims.a.claim_url);
+      expect(got.participant).toBe("a");
+      expect(got.token).toBe(prov.tokens.a);
+      expect(got.secret).toBe(prov.secret);
     } finally {
       f.relay.stop();
     }

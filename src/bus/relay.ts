@@ -5,6 +5,14 @@
 // a Byzantine relay. Bodies are AEAD ciphertext under the channel secret; the
 // relay sees sizes, timing, and IPs — stated plainly, not "learns nothing".
 //
+// One deliberate widening: one-time claim URLs (see below) let a remote
+// participant fetch its bearer token + the channel secret without the
+// operator pasting long-lived secrets into a chat transcript. While a claim
+// is outstanding the relay holds that participant's channel secret in
+// memory — bounded by the claim TTL (default 1h) and deleted on redemption
+// or expiry. The relay never sees message plaintext; claims only move the
+// secret the participant was going to receive anyway.
+//
 // Load-bearing semantics (all tested):
 // - msg_id dedupe: a POST with a previously seen msg_id returns the original
 //   {seq} without appending — retries are always safe.
@@ -18,7 +26,7 @@
 // the log. Senders re-publish the same msg_id; the auditor re-publishes its
 // deterministic terminal control. Restart = a fresh channel provisioning.
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 const CHANNEL_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const MAX_POST_BYTES = 64 * 1024;
@@ -33,6 +41,17 @@ export interface RelayStoredMessage {
   ct: string;
 }
 
+export interface RelayClaim {
+  id: string;
+  participant: string;
+  token: string;
+  /** channel secret, hex — held only until redemption or expiry */
+  secret: string;
+  epoch: string;
+  /** Date.now() ms after which the claim is dead */
+  expiresAt: number;
+}
+
 export interface RelayChannel {
   id: string;
   epoch: string;
@@ -43,6 +62,8 @@ export interface RelayChannel {
   messages: RelayStoredMessage[];
   msgIndex: Map<string, RelayStoredMessage>;
   waiters: Set<() => void>;
+  /** one-time onboarding claims, id -> claim; burned on redeem, pruned on expiry */
+  claims: Map<string, RelayClaim>;
 }
 
 export interface RelayHandle {
@@ -140,6 +161,7 @@ export function startRelay(opts: { port?: number; adminToken: string }): RelayHa
           messages: [],
           msgIndex: new Map(),
           waiters: new Set(),
+          claims: new Map(),
         });
         return json({ ok: true, channel, epoch }, 201);
       }
@@ -159,6 +181,54 @@ export function startRelay(opts: { port?: number; adminToken: string }): RelayHa
         }
         if (ch.auditor === author) ch.auditor = null;
         return removed ? json({ ok: true, revoked: author }) : json({ error: "no such author" }, 404);
+      }
+
+      // ---- one-time onboarding claims ----
+      // Minting is admin-only and carries the channel secret (the relay
+      // otherwise never holds it). Redemption is unauthenticated: the
+      // unguessable claim id is the credential, single-use, TTL-bounded.
+      // The operator pastes only the claim URL into chat with the remote
+      // participant — never the long-lived token or channel secret.
+      const claimMintMatch = /^\/admin\/channels\/([A-Za-z0-9_-]{1,128})\/claims$/.exec(path);
+      if (claimMintMatch && method === "POST") {
+        if (!isAdmin(req)) return json({ error: "unauthorized" }, 401);
+        const ch = channels.get(claimMintMatch[1]);
+        if (!ch) return json({ error: "no such channel" }, 404);
+        let body: Record<string, unknown>;
+        try {
+          body = (await req.json()) as Record<string, unknown>;
+        } catch {
+          return json({ error: "invalid JSON body" }, 400);
+        }
+        const participant = typeof body.participant === "string" ? body.participant : "";
+        const secret = typeof body.channel_secret === "string" ? body.channel_secret : "";
+        let token: string | null = null;
+        for (const [tok, author] of ch.tokens) {
+          if (author === participant) {
+            token = tok;
+            break;
+          }
+        }
+        if (!token) return json({ error: "no such participant" }, 400);
+        if (!secret) return json({ error: "channel_secret is required" }, 400);
+        const ttlMs = Math.min(
+          24 * 3_600_000,
+          Math.max(60_000, typeof body.ttl_ms === "number" && body.ttl_ms > 0 ? body.ttl_ms : 3_600_000)
+        );
+        const id = randomBytes(24).toString("hex");
+        const claim: RelayClaim = {
+          id,
+          participant,
+          token,
+          secret,
+          epoch: ch.epoch,
+          expiresAt: Date.now() + ttlMs,
+        };
+        ch.claims.set(id, claim);
+        return json(
+          { ok: true, claim_id: id, expires_at: new Date(claim.expiresAt).toISOString() },
+          201
+        );
       }
 
       // ---- channel API ----
@@ -237,6 +307,31 @@ export function startRelay(opts: { port?: number; adminToken: string }): RelayHa
           return json({ ok: true, channel: ch.id, auditor: author });
         }
         return json({ error: `auditor lease held by ${ch.auditor}` }, 409);
+      }
+
+      // Claim redemption: unauthenticated, single-use. Burn the claim before
+      // responding so a concurrent double-fetch cannot both succeed.
+      const claimMatch = /^\/c\/([A-Za-z0-9_-]{1,128})\/claim\/([A-Za-z0-9_-]{1,128})$/.exec(path);
+      if (claimMatch && method === "GET") {
+        const ch = channels.get(claimMatch[1]);
+        if (!ch) return json({ error: "no such channel" }, 404);
+        const claim = ch.claims.get(claimMatch[2]);
+        if (!claim) return json({ error: "no such claim" }, 404);
+        ch.claims.delete(claim.id);
+        if (Date.now() >= claim.expiresAt) {
+          return json({ error: "claim expired" }, 410);
+        }
+        console.log(
+          `[relay] claim redeemed channel=${ch.id} participant=${claim.participant} ` +
+            `token_fp=${tokenFingerprint(claim.token)}`
+        );
+        return json({
+          participant: claim.participant,
+          token: claim.token,
+          channel_secret: claim.secret,
+          channel: ch.id,
+          epoch: claim.epoch,
+        });
       }
 
       return json({ error: "not found" }, 404);

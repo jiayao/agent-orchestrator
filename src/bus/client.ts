@@ -163,3 +163,67 @@ export async function adminRevokeToken(
   const body = await readBody(res);
   if (!res.ok) throw new BusError(`revoke rejected: ${body.error ?? res.status}`, res.status);
 }
+
+export interface MintedClaim {
+  claim_id: string;
+  expires_at: string;
+}
+
+/**
+ * Mint a one-time onboarding claim for a participant (admin-only). The
+ * channel secret travels with the mint request — the relay otherwise never
+ * holds it — and is handed to the participant exactly once on redemption.
+ */
+export async function adminMintClaim(
+  busUrl: string,
+  adminToken: string,
+  channel: string,
+  participant: string,
+  channelSecret: string,
+  ttlMs = 3_600_000
+): Promise<MintedClaim> {
+  const res = await fetch(
+    `${busUrl.replace(/\/+$/, "")}/admin/channels/${encodeURIComponent(channel)}/claims`,
+    {
+      method: "POST",
+      headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ participant, channel_secret: channelSecret, ttl_ms: ttlMs }),
+    }
+  );
+  const body = await readBody(res);
+  if (!res.ok) throw new BusError(`claim mint rejected: ${body.error ?? res.status}`, res.status);
+  if (typeof body.claim_id !== "string" || typeof body.expires_at !== "string") {
+    throw new BusError("claim mint returned a malformed response", res.status);
+  }
+  return { claim_id: body.claim_id, expires_at: body.expires_at };
+}
+
+export interface ClaimBundle {
+  participant: string;
+  token: string;
+  channel_secret: string;
+  channel: string;
+  epoch: string;
+}
+
+/**
+ * Redeem a one-time claim URL. Single-use: a second fetch gets 410, an
+ * expired or unknown claim gets 404/410. The caller should persist the
+ * bundle to a 0600 file and never paste it into chat.
+ */
+export async function fetchClaim(claimUrl: string): Promise<ClaimBundle> {
+  const res = await fetch(claimUrl);
+  const body = await readBody(res);
+  if (!res.ok) throw new BusError(`claim fetch rejected: ${body.error ?? res.status}`, res.status);
+  const { participant, token, channel_secret, channel, epoch } = body;
+  if (
+    typeof participant !== "string" ||
+    typeof token !== "string" ||
+    typeof channel_secret !== "string" ||
+    typeof channel !== "string" ||
+    typeof epoch !== "string"
+  ) {
+    throw new BusError("claim returned a malformed bundle", res.status);
+  }
+  return { participant, token, channel_secret, channel, epoch };
+}
