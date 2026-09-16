@@ -18,6 +18,19 @@ export class BusError extends Error {
 
 export type FetchFn = typeof fetch;
 
+/**
+ * Parse a JSON response body defensively. res.json() can *resolve* to null
+ * (a proxy or a dropped connection can hand us an empty/null body with a
+ * non-OK status) — the catch above only covers rejections. Normalize
+ * anything that isn't an object to {} so `body.error` never throws.
+ */
+async function readBody(res: Response): Promise<Record<string, unknown>> {
+  const parsed: unknown = await res.json().catch(() => ({}));
+  return typeof parsed === "object" && parsed !== null
+    ? (parsed as Record<string, unknown>)
+    : {};
+}
+
 export interface PublishAck {
   seq: number;
   msg_id: string;
@@ -68,7 +81,7 @@ export class BusClient {
     } catch (e) {
       throw new BusError(`publish failed: ${(e as Error).message}`);
     }
-    const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    const body = await readBody(res);
     if (!res.ok) throw new BusError(`publish rejected: ${body.error ?? res.status}`, res.status);
     return {
       seq: body.seq as number,
@@ -92,7 +105,7 @@ export class BusClient {
     } catch (e) {
       throw new BusError(`poll failed: ${(e as Error).message}`);
     }
-    const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    const body = await readBody(res);
     if (!res.ok) throw new BusError(`poll rejected: ${body.error ?? res.status}`, res.status);
     return {
       messages: (body.messages ?? []) as RelayMessage[],
@@ -116,7 +129,7 @@ export class BusClient {
     } catch (e) {
       throw new BusError(`lease request failed: ${(e as Error).message}`);
     }
-    const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    const body = await readBody(res);
     if (!res.ok) throw new BusError(`lease rejected: ${body.error ?? res.status}`, res.status);
     return { auditor: body.auditor as string };
   }
@@ -133,7 +146,7 @@ export async function adminProvisionChannel(
     headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/json" },
     body: JSON.stringify({ channel: opts.channel, epoch: opts.epoch, tokens: opts.tokens }),
   });
-  const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  const body = await readBody(res);
   if (!res.ok) throw new BusError(`provisioning rejected: ${body.error ?? res.status}`, res.status);
 }
 
@@ -147,6 +160,6 @@ export async function adminRevokeToken(
     `${busUrl.replace(/\/+$/, "")}/admin/channels/${encodeURIComponent(channel)}/tokens/${encodeURIComponent(author)}`,
     { method: "DELETE", headers: { authorization: `Bearer ${adminToken}` } }
   );
-  const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  const body = await readBody(res);
   if (!res.ok) throw new BusError(`revoke rejected: ${body.error ?? res.status}`, res.status);
 }
