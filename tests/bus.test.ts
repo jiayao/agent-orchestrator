@@ -484,6 +484,27 @@ describe("bus auditor", () => {
   }, T);
 });
 
+describe("bus client resilience", () => {
+  test("null response body degrades to BusError, not TypeError", async () => {
+    // Regression: a proxy/dropped connection can hand poll() a non-OK
+    // response whose body parses as JSON null. readBody must normalize it
+    // to {} so the rejection path reads body.error safely.
+    const nullBodyFetch = (async () =>
+      new Response("null", { status: 502, headers: { "content-type": "application/json" } })
+    ) as FetchFn;
+    const client = new BusClient({
+      busUrl: "https://relay.invalid", channel: "chat-x",
+      token: "t", secret: "00".repeat(32), fetchFn: nullBodyFetch,
+    });
+    const err = await client.poll(0, 10).then(
+      () => null,
+      (e) => e
+    );
+    expect(err).toBeInstanceOf(BusError);
+    expect((err as BusError).message).toMatch(/poll rejected: 502/);
+  });
+});
+
 describe("bus config", () => {
   test("kind=bus validates bus_url + token_env and rejects [agents.command]", async () => {
     const base = {
