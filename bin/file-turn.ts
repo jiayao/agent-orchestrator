@@ -55,6 +55,7 @@ const deadline = Date.now() + timeoutMs;
 while (!existsSync(replyPath)) {
   if (Date.now() > deadline) {
     process.stderr.write(`[file-turn] timeout after ${timeoutMs}ms — yielding (pass)\n`);
+    try { unlinkSync(pendingPath); } catch {}
     console.log(JSON.stringify({ body: "(no reply in time)", signal: "pass" }));
     process.exit(0);
   }
@@ -64,6 +65,10 @@ while (!existsSync(replyPath)) {
 // consume the reply atomically-ish: read then remove before echoing
 const replyText = readFileSync(replyPath, "utf8");
 unlinkSync(replyPath);
+// Drop the pending turn too: while it exists it means "a turn is awaiting the
+// agent's reply". A watcher can then wake the agent on its appearance, and
+// there is no stale-file race on the next turn.
+try { unlinkSync(pendingPath); } catch {}
 let reply: Record<string, unknown>;
 try {
   reply = JSON.parse(replyText) as Record<string, unknown>;
