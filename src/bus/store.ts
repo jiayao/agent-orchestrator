@@ -150,6 +150,47 @@ export class RelayStore {
       .run(channelId, author);
   }
 
+  /**
+   * Vacate a seat: drop every live token bound to it but keep the seat row,
+   * so the seat_id (and its display_name/role) survives revocation and a
+   * later mint/join can reclaim it. This is the difference between "left"
+   * and "was erased" that the old delete-only revoke collapsed.
+   */
+  vacateSeat(channelId: string, seatId: string): void {
+    const tx = this.db.transaction(() => {
+      this.db
+        .prepare("DELETE FROM tokens WHERE channel_id = ? AND author = ?")
+        .run(channelId, seatId);
+      this.db
+        .prepare("UPDATE seats SET state = 'vacant' WHERE channel_id = ? AND seat_id = ?")
+        .run(channelId, seatId);
+    });
+    tx();
+  }
+
+  /**
+   * Bind a (fresh) token hash to an existing seat and mark it claimed. Used
+   * when re-minting for a vacant seat: the seat row already exists, so this
+   * is an UPDATE + token INSERT rather than a provisioning-time create.
+   */
+  claimSeat(channelId: string, seatId: string, tokenHash: string): void {
+    const tx = this.db.transaction(() => {
+      // a seat may accumulate a replaced token; drop any prior row for it
+      this.db
+        .prepare("DELETE FROM tokens WHERE channel_id = ? AND author = ?")
+        .run(channelId, seatId);
+      this.db
+        .prepare("INSERT INTO tokens (channel_id, token_hash, author) VALUES (?, ?, ?)")
+        .run(channelId, tokenHash, seatId);
+      this.db
+        .prepare(
+          "UPDATE seats SET state = 'claimed' WHERE channel_id = ? AND seat_id = ?"
+        )
+        .run(channelId, seatId);
+    });
+    tx();
+  }
+
   /** Reload every channel with its token-hash map and ordered log. */
   loadChannels(): PersistedChannel[] {
     const channels = this.db

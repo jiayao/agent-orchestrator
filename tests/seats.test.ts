@@ -11,11 +11,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startRelay } from "../src/bus/relay.ts";
 import { RelayStore } from "../src/bus/store.ts";
-import { adminMintClaim, adminProvisionChannel, fetchClaim } from "../src/bus/client.ts";
+import {
+  adminMintClaim,
+  adminProvisionChannel,
+  adminRevokeToken,
+  BusClient,
+  fetchClaim,
+} from "../src/bus/client.ts";
 import { newChannelSecret, newToken } from "../src/bus/crypto.ts";
 
 async function channel(seats?: unknown) {
   const relay = startRelay({ port: 0, adminToken: "adm-test" });
+  const secret = newChannelSecret();
   const tokens = { a: newToken(), b: newToken(), orchestrator: newToken() };
   const id = "chat-seats";
   await adminProvisionChannel(relay.url, "adm-test", {
@@ -24,7 +31,7 @@ async function channel(seats?: unknown) {
     tokens,
     ...(seats !== undefined ? { seats: seats as never } : {}),
   });
-  return { relay, tokens, id, ch: relay.channel(id)! };
+  return { relay, secret, tokens, id, ch: relay.channel(id)! };
 }
 
 describe("seats: declaring the list", () => {
@@ -150,6 +157,105 @@ describe("seats: claim carries seat identity", () => {
       const bundle = await fetchClaim(`${relay.url}/c/chat-legacy/claim/${minted.claim_id}`);
       // present on a seat-aware relay, and identity-coherent when present
       expect(bundle.seat_id ?? bundle.participant).toBe("a");
+    } finally {
+      relay.stop();
+    }
+  });
+});
+
+describe("seats: revoke vacates rather than erases", () => {
+  test("the seat survives revocation and is marked vacant", async () => {
+    const { relay, ch, id } = await channel();
+    try {
+      await adminRevokeToken(relay.url, "adm-test", id, "a");
+      // the credential is gone...
+      expect([...ch.tokens.values()]).not.toContain("a");
+      // ...but the seat is still addressable, which is the whole point
+      expect(ch.seats.has("a")).toBe(true);
+      expect(ch.seats.get("a")!.state).toBe("vacant");
+      // the untouched seat is unaffected
+      expect(ch.seats.get("b")!.state).toBe("claimed");
+    } finally {
+      relay.stop();
+    }
+  });
+
+  test("a revoked participant's token no longer authenticates", async () => {
+    const { relay, secret, tokens, id } = await channel();
+    try {
+      await adminRevokeToken(relay.url, "adm-test", id, "a");
+      const dead = new BusClient({ busUrl: relay.url, channel: id, token: tokens.a, secret });
+      await expect(dead.poll(0, 0)).rejects.toThrow();
+    } finally {
+      relay.stop();
+    }
+  });
+
+  test("revoking an unknown seat is a 404, not a silent success", async () => {
+    const { relay, id } = await channel();
+    try {
+      await expect(adminRevokeToken(relay.url, "adm-test", id, "nobody")).rejects.toThrow(
+        /no such seat/
+      );
+    } finally {
+      relay.stop();
+    }
+  });
+});
+
+describe("seats: refilling a vacant seat", () => {
+  test("minting a vacant seat without a token is refused with a clear reason", async () => {
+    const { relay, secret, id } = await channel();
+    try {
+      await adminRevokeToken(relay.url, "adm-test", id, "a");
+      // this is exactly where the OLD relay said "no such participant" and
+      // made the refill impossible; now it names the real problem
+      await expect(adminMintClaim(relay.url, "adm-test", id, "a", secret)).rejects.toThrow(
+        /vacant/
+      );
+    } finally {
+      relay.stop();
+    }
+  });
+
+  test("minting a vacant seat with a fresh token rebinds it; the claim redeems", async () => {
+    const { relay, secret, id, ch } = await channel();
+    try {
+      await adminRevokeToken(relay.url, "adm-test", id, "a");
+      const fresh = newToken();
+      const minted = await adminMintClaim(relay.url, "adm-test", id, "a", secret, 60_000, fresh);
+
+      // the seat is claimed again, now holding the fresh credential
+      expect(ch.seats.get("a")!.state).toBe("claimed");
+      expect([...ch.tokens.values()]).toContain("a");
+
+      const bundle = await fetchClaim(`${relay.url}/c/${id}/claim/${minted.claim_id}`);
+      expect(bundle.participant).toBe("a");
+      expect(bundle.token).toBe(fresh);
+      // the redeemer can tell it walked into a refilled seat
+      expect(bundle.seat_id).toBe("a");
+      expect(bundle.seat_state).toBe("vacant");
+      expect(bundle.participants).toContain("a");
+      expect(bundle.attested).toBe(true);
+    } finally {
+      relay.stop();
+    }
+  });
+
+  test("the refilled credential authenticates; the revoked one cannot", async () => {
+    const { relay, secret, tokens, id } = await channel();
+    try {
+      await adminRevokeToken(relay.url, "adm-test", id, "a");
+      const fresh = newToken();
+      const minted = await adminMintClaim(relay.url, "adm-test", id, "a", secret, 60_000, fresh);
+      await fetchClaim(`${relay.url}/c/${id}/claim/${minted.claim_id}`);
+
+      const revived = new BusClient({ busUrl: relay.url, channel: id, token: fresh, secret });
+      // authenticates: an empty log is a valid poll, not an auth error
+      await expect(revived.poll(0, 0)).resolves.toBeDefined();
+
+      const dead = new BusClient({ busUrl: relay.url, channel: id, token: tokens.a, secret });
+      await expect(dead.poll(0, 0)).rejects.toThrow();
     } finally {
       relay.stop();
     }

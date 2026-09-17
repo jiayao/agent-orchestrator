@@ -257,9 +257,11 @@ describe("onboarding claims", () => {
       await expect(
         adminMintClaim(f.relay.url, "wrong-admin", f.ctx.channel, "a", f.secret)
       ).rejects.toThrow(/unauthorized/);
+      // an unknown id is not a seat on this channel: seats are the unit of
+      // addressing, so the refusal names the seat, not a "participant"
       await expect(
         adminMintClaim(f.relay.url, "adm-test", f.ctx.channel, "nobody", f.secret)
-      ).rejects.toThrow(/no such participant/);
+      ).rejects.toThrow(/no such seat/);
       await expect(
         adminMintClaim(f.relay.url, "adm-test", "chat-nope", "a", f.secret)
       ).rejects.toThrow(/no such channel/);

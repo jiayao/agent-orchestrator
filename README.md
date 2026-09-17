@@ -59,13 +59,41 @@ participant token writes as that participant.
 
 Relay endpoints (bearer auth; `POST /admin/*` takes the admin token):
 
-- `POST /admin/channels` — provision `{channel, epoch, tokens: {author: token}}`; requires an `orchestrator` author.
-- `DELETE /admin/channels/<channel>/tokens/<author>` — revoke a participant.
-- `POST /admin/channels/<channel>/claims` — mint a single-use onboarding claim `{participant, channel_secret, ttl_ms?, token?}` (admin-only; the relay holds the secret in memory only until redeem/expiry). `token` is the participant's raw bearer token — required only when minting after a relay restart (the relay persists token *hashes*, not raw tokens, so it can no longer re-derive them; the provisioner always knows them).
-- `GET /c/<channel>/claim/<id>` — redeem a claim once: returns `{participant, participants, peers, token, channel_secret, channel, epoch}`, then the claim is dead (second fetch 410, expired 410). `peers` is provisioning's attestation of the peer id — `team join --from-claim-url` persists the bundle to `bus.credentials.json` (0600), and the participant runtime aborts loudly if a wire turn arrives authored by anyone else.
+- `POST /admin/channels` — provision `{channel, epoch, tokens: {author: token}, seats?}`; requires an `orchestrator` author. `seats` is an optional ordered list of `{seat_id, display_name?, role?}`; absent = one seat per token author (minus the reserved `orchestrator`). Every seat must name an author that has a token, or provisioning is refused — a seat with no credential is neither reachable nor mintable.
+- `DELETE /admin/channels/<channel>/tokens/<author>` — revoke a participant. This **vacates** the seat: the live token row is deleted but the seat row survives with `state: "vacant"`, so the seat_id stays addressable and can be refilled. (Deleting the row would make the seat unmintable — the exact case seats exist for.)
+- `POST /admin/channels/<channel>/claims` — mint a single-use onboarding claim `{participant, channel_secret, ttl_ms?, token?}` (admin-only; the relay holds the secret in memory only until redeem/expiry). `token` is the participant's raw bearer token — required when minting after a relay restart (the relay persists token *hashes*, not raw tokens, so it can no longer re-derive them; the provisioner always knows them) **and required to refill a vacant seat** (a vacated seat has no live token by design, so the presented token is rebound to it).
+- `GET /c/<channel>/claim/<id>` — redeem a claim once: returns `{participant, participants, peers, token, channel_secret, channel, epoch, seat_id, seat_state}`, then the claim is dead (second fetch 410, expired 410). `seat_state` is `"vacant"` when the claim refilled a revoked seat, so a re-joining participant can tell it walked into an existing slot rather than a fresh one. `peers` is provisioning's attestation of the peer id — `team join --from-claim-url` persists the bundle to `bus.credentials.json` (0600), and the participant runtime aborts loudly if a wire turn arrives authored by anyone else.
 - `POST /c/<channel>/messages` — publish; a retried `msg_id` returns the original `seq` (`deduped: true`) and never appends twice.
 - `GET /c/<channel>/messages?since=<seq>&wait=<ms>` — long-poll; returns `{messages, latest}`.
 - `POST /c/<channel>/auditor` — take the auditor lease; one per channel, a second author gets 409.
+
+## Seats
+
+A **seat** is a channel's stable, addressable slot. Provisioning declares a
+seat list (default: one seat per speaking agent); a claim populates a seat; a
+revocation vacates it. The seat_id survives a revoke, so the same slot can be
+refilled without inventing a new identity.
+
+This is the difference the relay used to collapse. Revoking a token deleted
+the row, and mint validated against the token table — so a revoked participant
+was not merely unclaimable but *unmintable* (`400 no such participant`).
+Seats split "this credential is dead" from "this slot never existed": the
+token row goes, the seat row stays `vacant`, and re-minting with a fresh token
+rebinds it. That re-mint rides the same raw-token path a post-restart mint
+already uses, so the two share one code path rather than two.
+
+Seats are per-channel and durable: they persist in `relay.sqlite` alongside
+the token hashes, and a store written before seats existed derives them from
+its live tokens on boot (the reserved `orchestrator` author is never a seat).
+
+Note the deliberate limit: seats do **not** make N-party turn-taking work.
+The chat layer still requires exactly two *speakers*; a channel declaring an
+extra seat is holding an open slot for a later join or refill, not running a
+three-way conversation.
+
+`bin/provision.ts --seats a,b,reviewer` declares the list explicitly. A seat
+that names no configured `[[agents]]` entry is refused, and so is a seat list
+that omits a speaking agent.
 
 ## Relay durability and the Fly deployment
 
