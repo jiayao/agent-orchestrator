@@ -111,6 +111,14 @@ export async function provisionBusChat(
       ...(a.display_name ? { display_name: a.display_name } : {}),
       role: a.role,
     }));
+  // Every seat must be backed by a token — the relay refuses a seat with no
+  // credential behind it, so an open seat (declared, not yet occupied) would
+  // otherwise fail provisioning with "seat X has no token". Mint one token per
+  // seat_id. Claims stay bound to the two speaking agents: an open slot is
+  // joined later via a re-mint, not handed out at provision.
+  for (const s of seats) {
+    if (!(s.seat_id in tokens)) tokens[s.seat_id] = newToken();
+  }
   await adminProvisionChannel(busUrl, adminToken, { channel, epoch, tokens, seats });
   // One-time claim per participant: the operator hands the remote side the
   // claim URL instead of pasting the long-lived token + channel secret into

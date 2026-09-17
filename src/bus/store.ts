@@ -143,13 +143,6 @@ export class RelayStore {
       .run(channelId, m.seq, m.msg_id, m.author, m.ts, m.nonce, m.ct);
   }
 
-  /** Revoke every token issued to an author on a channel. */
-  deleteAuthorTokens(channelId: string, author: string): void {
-    this.db
-      .prepare("DELETE FROM tokens WHERE channel_id = ? AND author = ?")
-      .run(channelId, author);
-  }
-
   /**
    * Vacate a seat: drop every live token bound to it but keep the seat row,
    * so the seat_id (and its display_name/role) survives revocation and a
@@ -161,8 +154,14 @@ export class RelayStore {
       this.db
         .prepare("DELETE FROM tokens WHERE channel_id = ? AND author = ?")
         .run(channelId, seatId);
+      // Upsert, not UPDATE: a seat derived by the pre-seat migration may not
+      // have a row yet, and an UPDATE against a missing row is a silent no-op
+      // that loses the seat on the next boot.
       this.db
-        .prepare("UPDATE seats SET state = 'vacant' WHERE channel_id = ? AND seat_id = ?")
+        .prepare(
+          "INSERT INTO seats (channel_id, seat_id, state) VALUES (?, ?, 'vacant') " +
+            "ON CONFLICT(channel_id, seat_id) DO UPDATE SET state = 'vacant'"
+        )
         .run(channelId, seatId);
     });
     tx();
@@ -184,7 +183,8 @@ export class RelayStore {
         .run(channelId, tokenHash, seatId);
       this.db
         .prepare(
-          "UPDATE seats SET state = 'claimed' WHERE channel_id = ? AND seat_id = ?"
+          "INSERT INTO seats (channel_id, seat_id, state) VALUES (?, ?, 'claimed') " +
+            "ON CONFLICT(channel_id, seat_id) DO UPDATE SET state = 'claimed'"
         )
         .run(channelId, seatId);
     });
@@ -241,12 +241,21 @@ export class RelayStore {
     // Migration: a store written before seats existed has no seat rows. Derive
     // them from live tokens (minus the reserved orchestrator author) so an
     // upgraded relay does not report an empty seat list for existing channels.
+    // The derived rows are then PERSISTED: vacate/claim write `seats` rows, so
+    // an in-memory-only migration would make those writes no-ops and lose the
+    // seat on the next boot. INSERT OR IGNORE leaves existing rows untouched.
+    const insDerivedSeat = this.db.prepare(
+      "INSERT OR IGNORE INTO seats (channel_id, seat_id, display_name, role, state) " +
+        "VALUES (?, ?, NULL, NULL, ?)"
+    );
     for (const c of byChannel.values()) {
-      if (c.seats.size > 0) continue;
-      for (const author of c.tokens.values()) {
-        if (author === "orchestrator") continue;
-        c.seats.set(author, { seat_id: author, state: "claimed" });
+      if (c.seats.size === 0) {
+        for (const author of c.tokens.values()) {
+          if (author === "orchestrator") continue;
+          c.seats.set(author, { seat_id: author, state: "claimed" });
+        }
       }
+      for (const s of c.seats.values()) insDerivedSeat.run(c.id, s.seat_id, s.state);
     }
     for (const m of msgRows) {
       byChannel.get(m.channel_id)?.messages.push({

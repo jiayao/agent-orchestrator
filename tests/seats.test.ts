@@ -19,6 +19,7 @@ import {
   fetchClaim,
 } from "../src/bus/client.ts";
 import { newChannelSecret, newToken } from "../src/bus/crypto.ts";
+import { provisionBusChat } from "../src/bus/session.ts";
 
 async function channel(seats?: unknown) {
   const relay = startRelay({ port: 0, adminToken: "adm-test" });
@@ -141,24 +142,29 @@ describe("seats: claim carries seat identity", () => {
   });
 
   test("the seat fields are additive: a bundle without them still parses", async () => {
-    // A relay that predates seats returns no seat_id/seat_state. The redeemer
-    // must degrade to seat_id = participant rather than reject the bundle —
-    // rejecting would throw AFTER the relay burned the one-time claim.
-    const relay = startRelay({ port: 0, adminToken: "adm-test" });
+    // A relay that predates seats returns a body with NO seat_id/seat_state.
+    // Stub that response literally rather than hitting a seat-aware relay —
+    // otherwise the test passes on fields the old relay would never send.
+    const stub = Bun.serve({
+      port: 0,
+      fetch: () =>
+        Response.json({
+          participant: "a",
+          token: "tok-legacy",
+          channel_secret: "sec-legacy",
+          channel: "chat-legacy",
+          epoch: "e1",
+        }),
+    });
     try {
-      const secret = newChannelSecret();
-      const tokens = { a: newToken(), orchestrator: newToken() };
-      await adminProvisionChannel(relay.url, "adm-test", {
-        channel: "chat-legacy",
-        epoch: "e1",
-        tokens,
-      });
-      const minted = await adminMintClaim(relay.url, "adm-test", "chat-legacy", "a", secret, 60_000);
-      const bundle = await fetchClaim(`${relay.url}/c/chat-legacy/claim/${minted.claim_id}`);
-      // present on a seat-aware relay, and identity-coherent when present
-      expect(bundle.seat_id ?? bundle.participant).toBe("a");
+      const bundle = await fetchClaim(`http://127.0.0.1:${stub.port}/claim/legacy`);
+      expect(bundle.participant).toBe("a");
+      // the redeemer must degrade, not reject: rejecting throws AFTER the
+      // relay burned the one-time claim
+      expect(bundle.seat_id).toBeUndefined();
+      expect(bundle.seat_state).toBeUndefined();
     } finally {
-      relay.stop();
+      stub.stop(true);
     }
   });
 });
@@ -305,5 +311,61 @@ describe("seats: durable from the start", () => {
     expect([...loaded.seats.keys()].sort()).toEqual(["a", "b"]);
     for (const s of loaded.seats.values()) expect(s.state).toBe("claimed");
     s2.close();
+  });
+
+  test("derived seats are persisted: vacate survives a reload (pre-seat store)", () => {
+    // The migration derives seats from tokens. If those rows are only in
+    // memory, vacate's write hits a missing row and the seat disappears on
+    // the next boot (refill then 400 no such seat). Persisting on boot -
+    // or upserting on vacate - must keep the seat addressable.
+    const dir = mkdtempSync(join(tmpdir(), "team-seats-persist-"));
+    const hash = (t: string) => new Bun.CryptoHasher("sha256").update(t).digest("hex");
+
+    const s1 = new RelayStore(dir);
+    s1.createChannel(
+      "chat-old",
+      "e1",
+      new Date().toISOString(),
+      [[hash(newToken()), "a"], [hash(newToken()), "orchestrator"]],
+      []
+    );
+    s1.close();
+
+    // boot derives the seat, then it is revoked
+    const s2 = new RelayStore(dir);
+    s2.loadChannels();
+    s2.vacateSeat("chat-old", "a");
+    s2.close();
+
+    // reload: the seat must still be there, and vacant
+    const s3 = new RelayStore(dir);
+    const [after] = s3.loadChannels();
+    expect(after.seats.has("a")).toBe(true);
+    expect(after.seats.get("a")!.state).toBe("vacant");
+    s3.close();
+  });
+
+  test("an open seat passes provisioning (token minted per seat_id)", async () => {
+    // The relay refuses a seat with no token behind it, so a declared open
+    // slot must still carry a credential or provisioning 400s at "seat X has
+    // no token". Claims stay bound to the two speaking agents.
+    const relay = startRelay({ port: 0, adminToken: "adm-test" });
+    try {
+      const agents = [
+        { id: "a", kind: "bus", bus_url: relay.url },
+        { id: "b", kind: "bus", bus_url: relay.url },
+      ] as Parameters<typeof provisionBusChat>[2];
+      const prov = await provisionBusChat(relay.url, "adm-test", agents, {
+        seats: [{ seat_id: "a" }, { seat_id: "b" }, { seat_id: "reviewer" }],
+      });
+      const ch = relay.channel(prov.channel)!;
+      expect([...ch.seats.keys()].sort()).toEqual(["a", "b", "reviewer"]);
+      // the open seat is backed by a token...
+      expect([...ch.tokens.values()]).toContain("reviewer");
+      // ...but is not handed a claim: onboarding stays at the two speakers
+      expect(Object.keys(prov.claims).sort()).toEqual(["a", "b"]);
+    } finally {
+      relay.stop();
+    }
   });
 });
