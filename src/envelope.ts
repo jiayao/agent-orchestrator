@@ -20,6 +20,7 @@ export interface ExtractedEnvelope {
 }
 
 const OPEN_RE = /<<<(TEAM_EVENT_V1|TEAM_RESULT_V1)[ \t]*\r?\n/;
+const OPEN_G = new RegExp(OPEN_RE.source, "g");
 
 /** Incremental parser: feed chunks of stdout; complete envelopes come back. */
 export class EnvelopeStreamParser {
@@ -36,6 +37,22 @@ export class EnvelopeStreamParser {
       const close = kind + ">>>";
       const contentStart = m.index + m[0].length;
       const end = this.buf.indexOf(close, contentStart);
+      // Resync: while seeking the closer, a new valid opener may appear first —
+      // the envelope under scan was truncated. Emit the dead partial as a
+      // malformed record (the log still sees it) and resume at the new opener,
+      // so a torn envelope can never swallow the ones after it.
+      OPEN_G.lastIndex = contentStart;
+      const nm = OPEN_G.exec(this.buf);
+      if (nm && (end === -1 || nm.index < end)) {
+        out.push({
+          kind,
+          raw: this.buf.slice(m.index, nm.index).trim(),
+          json: null,
+          parse_error: "unterminated envelope; resynchronized at next opener",
+        });
+        this.buf = this.buf.slice(nm.index);
+        continue;
+      }
       if (end === -1) {
         // incomplete envelope; keep everything from the opening marker
         if (m.index > 0) this.buf = this.buf.slice(m.index);

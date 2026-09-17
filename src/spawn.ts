@@ -147,8 +147,8 @@ export async function spawnAgent(
 
   if (spec.stdin === "prompt") {
     try {
-      proc.stdin.write(prompt);
-      proc.stdin.end();
+      proc.stdin?.write(prompt);
+      proc.stdin?.end();
     } catch {
       // child may have exited already
     }
@@ -218,7 +218,12 @@ export async function spawnAgent(
 
   const exitCode = await proc.exited;
   clearTimeout(timer);
-  await Promise.all([readStdout, readStderr]);
+  // bound the post-exit drain: without setsid a detached grandchild can hold
+  // the pipes open — take whatever arrived within a short grace window
+  await Promise.race([
+    Promise.all([readStdout, readStderr]),
+    new Promise((r) => setTimeout(r, 2_000)),
+  ]);
 
   const stdout = stdoutChunks.join("");
   const stderr = stderrChunks.join("");

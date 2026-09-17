@@ -148,9 +148,17 @@ export interface TeamEvent {
   run_id?: string;
   signal?: ChatSignal; // chat "turn" events
   malformed?: boolean; // chat "turn" events whose result envelope was absent/broken
+  /** bus (v0.2): the auditor's verdict on a bus_record — the wire envelope and
+   *  its validation outcome commit atomically in one record. */
+  verdict?: "turn" | "ignored" | "control_started" | "control_ended";
+  /** bus (v0.2): why an ignored bus_record was not accepted */
+  ignore_why?: string;
   /** bus (v0.2): wire metadata for records sourced from the relay.
-   *  On accepted "turn" events: {channel, seq, msg_id, author, in_reply_to,
-   *  payload_hash}. On "bus_raw" records: the relayed envelope as observed.
+   *  On "bus_record" events: the full relayed envelope as observed —
+   *  {channel, seq, msg_id, author, nonce, ct, payload_hash} plus
+   *  in_reply_to for turn payloads and control fields for control records.
+   *  On accepted "turn" events (local + legacy bus logs): {channel, seq,
+   *  msg_id, author, in_reply_to, payload_hash}.
    *  On "chat_ended": {channel, seq, msg_id, reason, terminal_seq}. */
   bus?: {
     channel: string;
@@ -158,6 +166,10 @@ export interface TeamEvent {
     msg_id: string;
     author?: string;
     in_reply_to?: number | null;
+    /** the wire envelope as relayed — persisted so committed records can be
+     *  re-decrypted and re-validated on restart */
+    nonce?: string;
+    ct?: string;
     payload_hash?: string;
     control?: "chat_started" | "chat_ended"; // committed control records
     first_speaker?: string; // chat_started

@@ -11,6 +11,7 @@
 
 import type { ChatSignal, RosterEntry, TeamEvent } from "../types.ts";
 import { isChatSignal } from "../chat.ts";
+import { peerOf as corePeerOf } from "../chatcore.ts";
 
 export interface TurnPayload {
   v: 1;
@@ -175,6 +176,7 @@ export type IgnoreWhy =
   | "not_participant" // author is neither participant nor orchestrator-control
   | "not_orchestrator" // control message from a non-orchestrator author
   | "ended" // the chat already ended
+  | "stale_ended" // chat_ended claims a terminal_seq behind accepted turns
   | "bad_shape"; // payload didn't decode
 
 export type Validation =
@@ -209,7 +211,7 @@ export class TurnValidator {
   }
 
   peerOf(author: string): string {
-    return author === this.participants[0] ? this.participants[1] : this.participants[0];
+    return corePeerOf(this.participants, author);
   }
 
   /**
@@ -232,6 +234,13 @@ export class TurnValidator {
       }
       // chat_ended
       if (this.ended) return { kind: "ignore", why: "ended" };
+      // Stale end: the control claims the chat ended at terminal_seq, but we
+      // have already accepted turns beyond it. A decision made with incomplete
+      // information (e.g. from a crashed auditor) must not override the turn
+      // stream's ground truth.
+      if (payload.terminal_seq! < (this.lastAcceptedSeq ?? 0)) {
+        return { kind: "ignore", why: "stale_ended" };
+      }
       this.ended = { reason: payload.reason!, terminalSeq: payload.terminal_seq! };
       return { kind: "ended", reason: this.ended.reason, terminalSeq: this.ended.terminalSeq };
     }
@@ -289,10 +298,33 @@ export class TurnValidator {
     this.ended = snap.ended;
   }
 
-  /** Rebuild validator state by replaying committed bus events in order. */
-  replayCommitted(events: TeamEvent[]): void {
+  /**
+   * Rebuild validator state by replaying committed records in order.
+   * `bus_record` events carry the full wire envelope (nonce + ct), so the
+   * replay re-decrypts and re-validates the actual relayed payload — the
+   * verdict field on the record is information, not authority. `decrypt`
+   * maps the wire fields back to the plaintext payload. Legacy materialized
+   * events (pre-bus_record logs: turn/chat_started/chat_ended) are still
+   * ingested so older task dirs remain resumable.
+   */
+  replayCommitted(
+    events: TeamEvent[],
+    decrypt?: (wire: { msg_id: string; nonce: string; ct: string }) => string | null
+  ): void {
     for (const ev of events) {
       if (!ev.bus) continue;
+      if (ev.type === "bus_record") {
+        let payload: BusPayload | null = null;
+        if (decrypt && ev.bus.nonce !== undefined && ev.bus.ct !== undefined) {
+          const pt = decrypt({ msg_id: ev.bus.msg_id, nonce: ev.bus.nonce, ct: ev.bus.ct });
+          if (pt !== null) payload = decodePayload(pt);
+        }
+        this.ingest(
+          { seq: ev.bus.seq, author: ev.bus.author ?? ev.actor },
+          payload
+        );
+        continue;
+      }
       if (ev.type === "turn") {
         this.ingest(
           { seq: ev.bus.seq, author: ev.bus.author ?? ev.actor },

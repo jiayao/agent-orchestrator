@@ -2,11 +2,44 @@
 // events.jsonl is the append-only source of truth; the orchestrator is the
 // sole writer. view.md is regenerated atomically (tmp + rename).
 
-import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { appendFile } from "node:fs/promises";
+import {
+  closeSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { appendFile, open } from "node:fs/promises";
+import { hostname } from "node:os";
 import { join } from "node:path";
 import type { DecisionRecord, TaskMeta, TeamEvent } from "./types.ts";
 import { sha256 } from "./config.ts";
+
+/** Thrown when a task's runner lock is held by a live process. */
+export class TaskLockError extends Error {
+  constructor(msg: string) {
+    super(msg);
+    this.name = "TaskLockError";
+  }
+}
+
+export interface LockHandle {
+  path: string;
+  release(): void;
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    // EPERM: the pid exists but isn't ours to signal — still alive
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
 
 export class Blackboard {
   private appendQueues = new Map<string, Promise<unknown>>();
@@ -107,22 +140,59 @@ export class Blackboard {
       ...(ev.run_id ? { run_id: ev.run_id } : {}),
       ...(ev.signal ? { signal: ev.signal } : {}),
       ...(ev.malformed ? { malformed: true } : {}),
+      ...(ev.verdict ? { verdict: ev.verdict } : {}),
+      ...(ev.ignore_why ? { ignore_why: ev.ignore_why } : {}),
       ...(ev.bus ? { bus: ev.bus } : {}),
     };
-    await appendFile(this.eventsPath(taskId), JSON.stringify(full) + "\n");
+    const path = this.eventsPath(taskId);
+    // "a+" (read/append): the torn-tail check below reads the last byte, so
+    // the fd must be readable — "a" alone is write-only and read() throws EBADF.
+    const fh = await open(path, "a+");
+    try {
+      // a crash mid-append leaves a torn tail with no trailing newline —
+      // terminate it so this event lands on its own line and stays parseable
+      const st = await fh.stat();
+      if (st.size > 0) {
+        const tail = Buffer.alloc(1);
+        await fh.read(tail, 0, 1, st.size - 1);
+        if (tail[0] !== 0x0a) await fh.write("\n");
+      }
+      await fh.write(JSON.stringify(full) + "\n");
+      await fh.sync(); // durable before the append is observable to readers
+    } finally {
+      await fh.close();
+    }
     return full;
   }
 
-  readEvents(taskId: string): TeamEvent[] {
+  /**
+   * Parse events.jsonl line by line, salvaging every well-formed record.
+   * Corrupt lines (a torn tail from a crash mid-append) are skipped, never
+   * silently zero the log: they're reported via `corrupt` for callers that
+   * want to warn. `readEvents` keeps the array-only shape for convenience.
+   */
+  readEventsTail(taskId: string): { events: TeamEvent[]; corrupt: string[] } {
+    const events: TeamEvent[] = [];
+    const corrupt: string[] = [];
+    let text: string;
     try {
-      const text = readFileSync(this.eventsPath(taskId), "utf8");
-      return text
-        .split("\n")
-        .filter((l) => l.trim().length > 0)
-        .map((l) => JSON.parse(l) as TeamEvent);
+      text = readFileSync(this.eventsPath(taskId), "utf8");
     } catch {
-      return [];
+      return { events, corrupt };
     }
+    for (const line of text.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        events.push(JSON.parse(line) as TeamEvent);
+      } catch {
+        corrupt.push(line);
+      }
+    }
+    return { events, corrupt };
+  }
+
+  readEvents(taskId: string): TeamEvent[] {
+    return this.readEventsTail(taskId).events;
   }
 
   eventCount(taskId: string): number {
@@ -132,6 +202,76 @@ export class Blackboard {
     } catch {
       return 0;
     }
+  }
+
+  /**
+   * Per-task sole-writer lock: tasks/<id>/<name> (default runner.lock)
+   * created O_EXCL with pid+hostname+command. A live same-host holder refuses
+   * the acquisition; a stale lock (dead pid) is reclaimed automatically;
+   * `steal` is the operator escape hatch. Release deletes only our own lock.
+   */
+  acquireLock(
+    taskId: string,
+    opts: { name?: string; steal?: boolean; cmd?: string } = {}
+  ): LockHandle {
+    const path = join(this.taskDir(taskId), opts.name ?? "runner.lock");
+    const info = {
+      pid: process.pid,
+      hostname: hostname(),
+      cmd: opts.cmd ?? process.argv.slice(1).join(" "),
+      acquired_at: new Date().toISOString(),
+    };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const fd = openSync(path, "wx"); // O_EXCL create — fails when held
+        try {
+          writeFileSync(fd, JSON.stringify(info, null, 2) + "\n");
+        } finally {
+          closeSync(fd);
+        }
+        let released = false;
+        return {
+          path,
+          release: () => {
+            if (released) return;
+            released = true;
+            try {
+              const cur = JSON.parse(readFileSync(path, "utf8"));
+              if (cur?.pid === process.pid) unlinkSync(path);
+            } catch {
+              // lock already gone or replaced — nothing to release
+            }
+          },
+        };
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+        let holder: { pid?: number; hostname?: string; cmd?: string } | null = null;
+        try {
+          holder = JSON.parse(readFileSync(path, "utf8"));
+        } catch {
+          // unreadable lock — treat as stale
+        }
+        const sameHost = !holder?.hostname || holder.hostname === hostname();
+        const alive =
+          sameHost && typeof holder?.pid === "number" && pidAlive(holder.pid);
+        if (opts.steal || !alive) {
+          try {
+            unlinkSync(path);
+          } catch {
+            // already gone — retry the create
+          }
+          continue;
+        }
+        const desc = `pid=${holder!.pid}@${holder!.hostname}${
+          holder!.cmd ? ` cmd=${JSON.stringify(holder!.cmd)}` : ""
+        }`;
+        throw new TaskLockError(
+          `task ${taskId} is locked by a live process (${desc}); ` +
+            `use --steal-lock to take over`
+        );
+      }
+    }
+    throw new TaskLockError(`task ${taskId}: could not acquire ${path}`);
   }
 
   initRunDir(taskId: string, runId: string): string {
@@ -196,8 +336,30 @@ export class Blackboard {
     for (const [round, evs] of [...rounds.entries()].sort((a, b) => a[0] - b[0])) {
       lines.push(`## Round ${round}`, "");
       for (const ev of evs) {
+        if (ev.type === "bus_record") {
+          if (ev.verdict === "turn") {
+            // accepted turns render like turns — this is the conversation
+            const sig = ev.signal ? ` signal=${ev.signal}` : "";
+            lines.push(
+              `### ${ev.event_id} — ${ev.actor} · turn ch_seq=${ev.bus?.seq ?? "?"}${sig}`,
+              ""
+            );
+            lines.push(ev.body, "");
+          } else {
+            // one line per wire message — full detail is in events.jsonl
+            const what =
+              ev.verdict === "control_started" || ev.verdict === "control_ended"
+                ? `${ev.verdict}${ev.bus?.reason ? ` reason=${ev.bus.reason}` : ""}`
+                : `ignored${ev.ignore_why ? ` (${ev.ignore_why})` : ""}`;
+            lines.push(
+              `- bus ch_seq=${ev.bus?.seq ?? "?"} author=${ev.bus?.author ?? ev.actor} msg_id=${ev.bus?.msg_id ?? "?"} ${what}${ev.unstructured ? " [undecryptable]" : ""}`,
+              ""
+            );
+          }
+          continue;
+        }
         if (ev.type === "bus_raw") {
-          // everything the relay served, one line each — full wire detail is in events.jsonl
+          // legacy raw records, one line each — full wire detail is in events.jsonl
           lines.push(
             `- raw ch_seq=${ev.bus?.seq ?? "?"} author=${ev.bus?.author ?? ev.actor} msg_id=${ev.bus?.msg_id ?? "?"}${ev.unstructured ? " [undecryptable]" : ""}`,
             ""
