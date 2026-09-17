@@ -753,7 +753,9 @@ async function cmdChat(args: ParsedArgs): Promise<void> {
 }
 
 /**
- * `team join --from-claim-url <url>` — the remote side's onboarding. The
+ * `team join --from-claim-url <url> [--peer <id>]` — the remote side's
+ * onboarding. `--peer` is a fallback for a relay that predates participant
+ * attestation. The
  * claim URL is the only thing that ever traveled through a chat transcript;
  * redeeming it once yields the bearer token, the channel secret, and the
  * relay-attested participant list (which entry is us, which is the peer).
@@ -767,7 +769,12 @@ async function cmdJoin(args: ParsedArgs): Promise<void> {
   }
   const dirFlag = args.flags.get("state-dir");
   const stateDir = typeof dirFlag === "string" ? resolve(dirFlag) : process.cwd();
-  const { creds, path } = await joinBusChat(claimUrl, stateDir);
+  // --peer is only consulted when the relay predates attestation and cannot
+  // name the peer itself; an attested bundle always wins.
+  const peerFlag = args.flags.get("peer");
+  const { creds, path } = await joinBusChat(claimUrl, stateDir, {
+    peerHint: typeof peerFlag === "string" ? peerFlag : undefined,
+  });
   const report = {
     ok: true,
     participant: creds.participant,
@@ -777,6 +784,7 @@ async function cmdJoin(args: ParsedArgs): Promise<void> {
     epoch: creds.epoch,
     bus_url: creds.bus_url,
     credentials_file: path,
+    attested: creds.attested ?? true,
     warning:
       creds.peers.length !== 1
         ? `expected a pairwise channel; provisioning attests ${creds.peers.length} peers`
@@ -786,6 +794,9 @@ async function cmdJoin(args: ParsedArgs): Promise<void> {
     printJson(report);
   } else {
     log(`joined channel ${creds.channel} (epoch ${creds.epoch}) on ${creds.bus_url}`);
+    if (creds.attested === false) {
+      log(`  NOTE: relay did not attest participants; peer came from --peer`);
+    }
     log(`  you are:        ${creds.participant}`);
     log(`  provisioned peer(s): ${creds.peers.join(", ") || "(none)"}`);
     log(`  participants:   ${creds.participants.join(", ")}`);

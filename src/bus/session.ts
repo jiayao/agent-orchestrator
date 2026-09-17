@@ -159,6 +159,8 @@ export async function claimBusSecrets(
   participant: string;
   participants: string[];
   peers: string[];
+  /** false when the relay predates attestation — `peers` is then empty */
+  attested: boolean;
   token: string;
   secret: string;
 }> {
@@ -171,6 +173,7 @@ export async function claimBusSecrets(
     participant: bundle.participant,
     participants: bundle.participants,
     peers: bundle.peers,
+    attested: bundle.attested,
     token: bundle.token,
     secret: bundle.channel_secret,
   };
@@ -191,6 +194,9 @@ export interface JoinCredentials {
   participants: string[];
   /** participants minus `participant` — the provisioned peer id(s) */
   peers: string[];
+  /** false when the relay predates attestation: participants/peers above
+   *  were supplied by the operator (`--peer`) rather than attested. */
+  attested?: boolean;
   token: string;
   channel_secret: string;
 }
@@ -236,16 +242,34 @@ export function readJoinCredentials(stateDir: string): JoinCredentials {
  */
 export async function joinBusChat(
   claimUrl: string,
-  stateDir: string
+  stateDir: string,
+  opts: { peerHint?: string } = {}
 ): Promise<{ creds: JoinCredentials; path: string }> {
   const got = await claimBusSecrets(claimUrl);
+  // A relay that predates attestation returns no participant list, so the
+  // peer id has to come from provisioning knowledge. Require it explicitly:
+  // guessing here would defeat the peer check the runtime performs.
+  let participants = got.participants;
+  let peers = got.peers;
+  if (!got.attested) {
+    const peer = opts.peerHint;
+    if (!peer) {
+      throw new Error(
+        `relay did not attest participants for ${got.channel} — pass the peer id ` +
+          `(from the orchestrator's connection instructions) to join`
+      );
+    }
+    participants = [got.participant, peer];
+    peers = [peer];
+  }
   const creds: JoinCredentials = {
     bus_url: got.busUrl,
     channel: got.channel,
     epoch: got.epoch,
     participant: got.participant,
-    participants: got.participants,
-    peers: got.peers,
+    participants,
+    peers,
+    attested: got.attested,
     token: got.token,
     channel_secret: got.secret,
   };
@@ -269,7 +293,8 @@ export function participantOptionsFromJoin(
   if (creds.peers.length !== 1) {
     throw new Error(
       `pairwise runtime needs exactly one provisioned peer; ` +
-        `channel ${creds.channel} attests participants=${JSON.stringify(creds.participants)}`
+        `channel ${creds.channel} ${creds.attested === false ? "was joined without attestation" : "attests"} ` +
+        `participants=${JSON.stringify(creds.participants)}`
     );
   }
   return {

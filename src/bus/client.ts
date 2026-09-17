@@ -206,7 +206,8 @@ export async function adminMintClaim(
 export interface ClaimBundle {
   participant: string;
   /** the channel's attested participant list (the auditor's "orchestrator"
-   *  author excluded); `participant` is always an entry */
+   *  author excluded); `participant` is always an entry when attested.
+   *  Empty when the relay predates attestation. */
   participants: string[];
   /** participants minus the redeemer — the provisioned peer id(s) */
   peers: string[];
@@ -214,6 +215,10 @@ export interface ClaimBundle {
   channel_secret: string;
   channel: string;
   epoch: string;
+  /** false when the relay did not carry the participant attestation, so
+   *  `participants`/`peers` are empty and the peer id must come from
+   *  provisioning knowledge instead of the claim. */
+  attested: boolean;
 }
 
 const isStringArray = (v: unknown): v is string[] =>
@@ -229,12 +234,13 @@ export async function fetchClaim(claimUrl: string): Promise<ClaimBundle> {
   const body = await readBody(res);
   if (!res.ok) throw new BusError(`claim fetch rejected: ${body.error ?? res.status}`, res.status);
   const { participant, participants, peers, token, channel_secret, channel, epoch } = body;
+  // Credentials are mandatory; the attestation is not. An older relay omits
+  // participants/peers, and rejecting that bundle throws *after* the relay
+  // burned the claim — a valid one-time URL destroyed over a field we can do
+  // without. Degrade instead: mark it unattested and let the caller supply
+  // the peer id from provisioning knowledge.
   if (
     typeof participant !== "string" ||
-    !isStringArray(participants) ||
-    !participants.includes(participant) ||
-    !isStringArray(peers) ||
-    peers.includes(participant) ||
     typeof token !== "string" ||
     typeof channel_secret !== "string" ||
     typeof channel !== "string" ||
@@ -242,5 +248,18 @@ export async function fetchClaim(claimUrl: string): Promise<ClaimBundle> {
   ) {
     throw new BusError("claim returned a malformed bundle", res.status);
   }
-  return { participant, participants, peers, token, channel_secret, channel, epoch };
+  const attested = isStringArray(participants) && isStringArray(peers);
+  if (attested && (!participants!.includes(participant) || peers!.includes(participant))) {
+    throw new BusError("claim attestation contradicts the redeemer", res.status);
+  }
+  return {
+    participant,
+    participants: attested ? participants! : [],
+    peers: attested ? peers! : [],
+    token,
+    channel_secret,
+    channel,
+    epoch,
+    attested,
+  };
 }
