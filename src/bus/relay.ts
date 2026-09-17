@@ -52,6 +52,10 @@ export interface RelayStoredMessage {
 export interface RelayClaim {
   id: string;
   participant: string;
+  /** the seat this claim populates. Equal to `participant` today, but kept
+   *  separate so a claim can address a seat independently of the redeemer's
+   *  id — the addressing model seats exist to enable. */
+  seat_id?: string;
   token: string;
   /** channel secret, hex — held only until redemption or expiry */
   secret: string;
@@ -351,6 +355,7 @@ export function startRelay(opts: {
         const claim: RelayClaim = {
           id,
           participant,
+          seat_id: participant,
           token,
           secret,
           epoch: ch.epoch,
@@ -470,6 +475,10 @@ export function startRelay(opts: {
           channel_secret: claim.secret,
           channel: ch.id,
           epoch: claim.epoch,
+          // seat binding: which stable slot this claim populated, so the
+          // redeemer addresses the seat, not a one-off participant name
+          seat_id: claim.seat_id ?? claim.participant,
+          seat_state: "claimed",
         });
       }
 

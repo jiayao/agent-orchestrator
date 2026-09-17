@@ -247,6 +247,13 @@ export interface ClaimBundle {
    *  `participants`/`peers` are empty and the peer id must come from
    *  provisioning knowledge instead of the claim. */
   attested: boolean;
+  /** the seat this claim is bound to (the redeemer's stable slot). Equal to
+   *  `participant` today; present so a future claim can address a seat that
+   *  is not the participant id. Absent on relays that predate seats. */
+  seat_id?: string;
+  /** whether the claimed seat was freshly provisioned ("claimed") or is
+   *  being refilled after a revoke ("vacant" at mint time). */
+  seat_state?: "claimed" | "vacant";
 }
 
 const isStringArray = (v: unknown): v is string[] =>
@@ -262,6 +269,7 @@ export async function fetchClaim(claimUrl: string): Promise<ClaimBundle> {
   const body = await readBody(res);
   if (!res.ok) throw new BusError(`claim fetch rejected: ${body.error ?? res.status}`, res.status);
   const { participant, participants, peers, token, channel_secret, channel, epoch } = body;
+  const { seat_id, seat_state } = body;
   // Credentials are mandatory; the attestation is not. An older relay omits
   // participants/peers, and rejecting that bundle throws *after* the relay
   // burned the claim — a valid one-time URL destroyed over a field we can do
@@ -289,5 +297,11 @@ export async function fetchClaim(claimUrl: string): Promise<ClaimBundle> {
     channel,
     epoch,
     attested,
+    // Seat binding is optional: a relay that predates seats omits it, and a
+    // redeemer must never fail over a cosmetic field (same reasoning as the
+    // attestation degrade above). Absent = "this relay has no seat concept",
+    // which callers treat as seat_id = participant.
+    ...(typeof seat_id === "string" ? { seat_id } : {}),
+    ...(seat_state === "claimed" || seat_state === "vacant" ? { seat_state } : {}),
   };
 }

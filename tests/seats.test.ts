@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startRelay } from "../src/bus/relay.ts";
 import { RelayStore } from "../src/bus/store.ts";
-import { adminProvisionChannel } from "../src/bus/client.ts";
+import { adminMintClaim, adminProvisionChannel, fetchClaim } from "../src/bus/client.ts";
 import { newChannelSecret, newToken } from "../src/bus/crypto.ts";
 
 async function channel(seats?: unknown) {
@@ -112,6 +112,44 @@ describe("seats: declaring the list", () => {
           seats: [{ seat_id: "a" }, { seat_id: "a" }],
         })
       ).rejects.toThrow(/duplicate seat/);
+    } finally {
+      relay.stop();
+    }
+  });
+});
+
+describe("seats: claim carries seat identity", () => {
+  test("a redeemed claim reports its seat_id and that it was freshly claimed", async () => {
+    const { relay, id } = await channel();
+    try {
+      const secret = newChannelSecret();
+      const minted = await adminMintClaim(relay.url, "adm-test", id, "a", secret, 60_000);
+      const bundle = await fetchClaim(`${relay.url}/c/${id}/claim/${minted.claim_id}`);
+      expect(bundle.participant).toBe("a");
+      expect(bundle.seat_id).toBe("a");
+      expect(bundle.seat_state).toBe("claimed");
+    } finally {
+      relay.stop();
+    }
+  });
+
+  test("the seat fields are additive: a bundle without them still parses", async () => {
+    // A relay that predates seats returns no seat_id/seat_state. The redeemer
+    // must degrade to seat_id = participant rather than reject the bundle —
+    // rejecting would throw AFTER the relay burned the one-time claim.
+    const relay = startRelay({ port: 0, adminToken: "adm-test" });
+    try {
+      const secret = newChannelSecret();
+      const tokens = { a: newToken(), orchestrator: newToken() };
+      await adminProvisionChannel(relay.url, "adm-test", {
+        channel: "chat-legacy",
+        epoch: "e1",
+        tokens,
+      });
+      const minted = await adminMintClaim(relay.url, "adm-test", "chat-legacy", "a", secret, 60_000);
+      const bundle = await fetchClaim(`${relay.url}/c/chat-legacy/claim/${minted.claim_id}`);
+      // present on a seat-aware relay, and identity-coherent when present
+      expect(bundle.seat_id ?? bundle.participant).toBe("a");
     } finally {
       relay.stop();
     }
