@@ -118,6 +118,11 @@ export function startRelay(opts: { port?: number; adminToken: string }): RelayHa
 
   const server = Bun.serve({
     port: opts.port ?? 0,
+    // Long-poll requests block up to MAX_WAIT_MS (30s) by design. Bun's
+    // default idle timeout is 10s, which would kill every poll longer than
+    // that mid-flight (the client sees a 502, not a timeout). Keep this
+    // comfortably above MAX_WAIT_MS.
+    idleTimeout: 60,
     async fetch(req) {
       const url = new URL(req.url);
       const path = url.pathname;
