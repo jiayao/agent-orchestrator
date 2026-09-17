@@ -30,7 +30,16 @@ if (!dir) {
   process.stderr.write("usage: bun bin/file-turn.ts --dir <handshake-dir> [--timeout-ms 110000]\n");
   process.exit(2);
 }
-const timeoutMs = Number(flags.get("timeout-ms") ?? "110000"); // stay under the 120s idle timeout
+// join-channel kills the turn handler at ITS --turn-timeout (default 600000).
+// A handler that outlives that kill is SIGKILLed mid-wait and the runtime then
+// publishes a junk "(turn handler failed)" pass to the peer. It exports the
+// budget as TEAM_TURN_TIMEOUT_MS so this handler can stay strictly inside it
+// and yield (pass) gracefully instead.
+const budgetMs = Number(process.env.TEAM_TURN_TIMEOUT_MS ?? "0");
+const MARGIN_MS = 15_000; // room to print the reply after the deadline
+const requestedMs = Number(flags.get("timeout-ms") ?? "110000");
+const timeoutMs =
+  budgetMs > 0 ? Math.max(1_000, Math.min(requestedMs, budgetMs - MARGIN_MS)) : requestedMs;
 
 mkdirSync(dir, { recursive: true });
 const pendingPath = join(dir, "pending-turn.json");

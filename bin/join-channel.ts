@@ -159,6 +159,9 @@ async function commandTurn(ctx: TurnContext): Promise<{ body: string; signal?: C
       TEAM_PARTICIPANT: ctx.agentId,
       TEAM_PEER: ctx.peerId,
       TEAM_TOPIC: ctx.topic ?? "",
+      // the handler's real budget: it must yield before the kill below, or the
+      // runtime publishes a junk "(turn handler failed)" turn instead.
+      TEAM_TURN_TIMEOUT_MS: String(turnTimeoutMs),
     },
   });
   const timer = setTimeout(() => proc.kill(), turnTimeoutMs);
