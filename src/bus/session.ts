@@ -8,7 +8,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Blackboard } from "../blackboard.ts";
-import type { AgentConfig, TaskMeta, TeamConfig } from "../types.ts";
+import type { AgentConfig, RosterEntry, TaskMeta, TeamConfig } from "../types.ts";
 import type { ChatSummary } from "../chat.ts";
 import { adminMintClaim, adminProvisionChannel, BusClient, fetchClaim, type ClaimBundle } from "./client.ts";
 import { newChannelSecret, newId, newToken } from "./crypto.ts";
@@ -36,6 +36,8 @@ export interface BusProvision {
   firstSpeaker: string;
   /** participant id -> one-time onboarding claim (single-use, TTL-bounded) */
   claims: Record<string, BusClaim>;
+  /** presentation-only name roster published on chat_started */
+  roster: RosterEntry[];
 }
 
 /** The file in the task dir holding channel secret + tokens (mode 0600). */
@@ -94,7 +96,27 @@ export async function provisionBusChat(
       expires_at: minted.expires_at,
     };
   }
-  return { busUrl, channel, epoch, secret, tokens, firstSpeaker: agents[0].id, claims };
+  return {
+    busUrl,
+    channel,
+    epoch,
+    secret,
+    tokens,
+    firstSpeaker: agents[0].id,
+    claims,
+    roster: buildRoster(agents),
+  };
+}
+
+/**
+ * Build the presentation-only roster for a pair of agents. Names are labels,
+ * not identities: the id is what the relay attests and what validation keys
+ * on, so a missing or duplicate display_name is always safe here.
+ */
+export function buildRoster(agents: AgentConfig[]): RosterEntry[] {
+  return agents.map((a) =>
+    a.display_name ? { id: a.id, display_name: a.display_name } : { id: a.id }
+  );
 }
 
 /**
@@ -130,7 +152,9 @@ export function connectionInstructions(
 ): string {
   const claim = prov.claims[agent.id];
   return [
-    `--- connection instructions for ${agent.id} ---`,
+    `--- connection instructions for ${agent.id}${
+      agent.display_name ? ` (${agent.display_name})` : ""
+    } ---`,
     `bus_url:    ${prov.busUrl}`,
     `channel:    ${prov.channel}`,
     `epoch:      ${prov.epoch}`,
@@ -191,6 +215,9 @@ export async function runBusChatSession(
       agents: bus.participants,
       firstSpeaker: bus.first_speaker,
       topic: meta.chat?.topic ?? bb.readArtifact(meta.id),
+      // Older tasks predate the roster field; passing undefined publishes the
+      // original wire shape.
+      roster: bus.roster,
     },
     opts
   );

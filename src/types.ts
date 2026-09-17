@@ -57,6 +57,17 @@ export interface AgentConfig {
   channel?: string; // default/pinned channel; `team chat` provisions a fresh one per chat
   /** env var name holding this participant's bearer token (minted at provisioning) */
   token_env?: string;
+  /** human-readable label carried in the chat roster. Presentation-only: it is
+   *  never an identity, and never enters auth or turn validation. */
+  display_name?: string;
+}
+
+/** One entry of the presentation-only chat roster carried on chat_started. */
+export interface RosterEntry {
+  /** wire participant id — relay-attested, authoritative for validation */
+  id: string;
+  /** human-readable label; may collide across participants, purely cosmetic */
+  display_name?: string;
 }
 
 export interface StderrPattern {
@@ -150,6 +161,7 @@ export interface TeamEvent {
     payload_hash?: string;
     control?: "chat_started" | "chat_ended"; // committed control records
     first_speaker?: string; // chat_started
+    roster?: RosterEntry[]; // chat_started (presentation-only labels)
     reason?: string; // chat_ended
     terminal_seq?: number; // chat_ended
   };
@@ -171,6 +183,9 @@ export interface ChatMeta {
     epoch: string;
     participants: [string, string];
     first_speaker: string;
+    /** presentation-only name roster, carried on the chat_started control.
+     *  Never authoritative: alternation and control authorship key on ids. */
+    roster?: RosterEntry[];
   };
 }
 

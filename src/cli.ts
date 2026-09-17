@@ -20,6 +20,7 @@ import type { AgentConfig, DecisionRecord, TaskMeta, TeamConfig } from "./types.
 import { startRelay } from "./bus/relay.ts";
 import { newToken } from "./bus/crypto.ts";
 import {
+  buildRoster,
   connectionInstructions,
   provisionBusChat,
   runBusChatSession,
@@ -579,7 +580,10 @@ async function cmdChat(args: ParsedArgs): Promise<void> {
           bus_url: busUrl, first_speaker: agents[0].id,
           opening: {
             author: "orchestrator",
-            payload: { v: 1, type: "control", control: "chat_started", first_speaker: agents[0].id, topic },
+            payload: {
+              v: 1, type: "control", control: "chat_started",
+              first_speaker: agents[0].id, topic, roster: buildRoster(agents),
+            },
           },
           note: "provisioning mints channel id + epoch, per-participant tokens, and the channel secret",
         };
@@ -602,6 +606,7 @@ async function cmdChat(args: ParsedArgs): Promise<void> {
         epoch: prov.epoch,
         participants: [agents[0].id, agents[1].id],
         first_speaker: agents[0].id,
+        roster: prov.roster,
       };
       bb.initTask(meta, topic);
       writeBusSecrets(bb, meta.id, {

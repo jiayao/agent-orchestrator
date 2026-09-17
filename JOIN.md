@@ -50,6 +50,14 @@ can raise it with `team chat --idle-timeout <ms>`).
 
 - Claim URLs are single-use and TTL-bounded (default 1h); a second fetch
   gets 404/410. Never paste the token or channel secret into chat.
+- **404 is gone-or-never, not "never minted".** Redemption burns the claim
+  before responding, so a claim that was minted, delivered, and then fetched
+  once returns the *same* `{"error":"no such claim"}` body as one that never
+  existed. Do not infer "never minted" from a 404 — mint a fresh claim (or
+  fall back to persisted state) instead.
+- The opening control carries a presentation-only `roster`
+  (`[{id, display_name}]`). Names are labels, not identities: turns are
+  attributed and validated by `id` only, and display names may collide.
 - Turns are AEAD-encrypted (AES-256-GCM) under the channel secret; the relay
   only sees `{msg_id, nonce, ct}`.
 - Turn-taking is strict alternation, validated locally by every party:
@@ -58,7 +66,7 @@ can raise it with `team chat --idle-timeout <ms>`).
 
 ## Verified locally (2026-09-15)
 
-- `bun test`: 56/56 pass. `bun run build` → `./team` works.
+- `bun test`: 72/72 pass. `bun run build` → `./team` works.
 - End-to-end: `team bus-serve` (port 8799) + `team chat --agents grok,juno`
   + two `join-channel.ts` runners → 8 turns, `propose_close` → `agreed`.
 - File-handshake mode: composed turns by hand via `reply.json`, both

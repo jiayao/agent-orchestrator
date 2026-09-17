@@ -181,6 +181,15 @@ export function validateConfig(raw: unknown, path: string): TeamConfig {
         errors.push(`agent ${JSON.stringify(id)}: auth_env must be an env var name`);
       }
 
+      // display_name is a presentation label, not an identity: collisions are
+      // allowed (two sides may both call themselves "moss") and it never
+      // enters auth or turn validation. Empty/whitespace is treated as absent.
+      const displayNameRaw = asString(a.display_name);
+      const displayName =
+        displayNameRaw !== undefined && displayNameRaw.trim() !== ""
+          ? displayNameRaw.trim()
+          : undefined;
+
       const cmd = a.command;
       if (!isObj(cmd)) {
         if (kind === "console") {
@@ -188,7 +197,7 @@ export function validateConfig(raw: unknown, path: string): TeamConfig {
             id, kind: "console", adapter: asString(a.adapter) ?? "console",
             model: asString(a.model), role, cost_tier: asString(a.cost_tier),
             cost_per_run_usd: asNumber(a.cost_per_run_usd),
-            auth_env: authEnv, env: {},
+            auth_env: authEnv, env: {}, display_name: displayName,
           });
         } else if (kind === "bus") {
           const busUrl = asString(a.bus_url);
@@ -208,7 +217,7 @@ export function validateConfig(raw: unknown, path: string): TeamConfig {
             model: asString(a.model), role, cost_tier: asString(a.cost_tier),
             cost_per_run_usd: asNumber(a.cost_per_run_usd),
             auth_env: authEnv, env: {},
-            bus_url: busUrl, channel, token_env: tokenEnv,
+            bus_url: busUrl, channel, token_env: tokenEnv, display_name: displayName,
           });
         } else {
           errors.push(`agent ${JSON.stringify(id)}: missing [agents.command]`);
@@ -288,6 +297,7 @@ export function validateConfig(raw: unknown, path: string): TeamConfig {
         auth_env: authEnv,
         command: { executable: executable ?? "", args, stdin: stdin as "prompt" | "null" },
         env,
+        display_name: displayName,
       });
     }
   }

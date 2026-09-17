@@ -21,7 +21,7 @@
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ChatSignal } from "../types.ts";
+import type { ChatSignal, RosterEntry } from "../types.ts";
 import { BusClient, BusError, type FetchFn } from "./client.ts";
 import {
   decodePayload,
@@ -42,6 +42,10 @@ export interface TranscriptTurn {
 export interface TurnContext {
   agentId: string;
   peerId: string;
+  /** presentation-only labels from the opening control, when published */
+  roster?: RosterEntry[];
+  /** display_name for the peer, when the roster carries one (else undefined) */
+  peerDisplayName?: string;
   channel: string;
   topic: string | null;
   /** accepted turns so far (validated against the deterministic rule) */
@@ -100,6 +104,8 @@ interface ParticipantState {
   own: string[];
   transcript: TranscriptTurn[];
   firstSpeaker: string | null;
+  /** presentation-only roster from chat_started; never used for validation */
+  roster: RosterEntry[] | null;
   expected: string | null;
   lastAcceptedSeq: number | null;
   /** latest accepted peer turn not yet answered (coalesced) */
@@ -123,6 +129,7 @@ export class ParticipantRuntime {
   private state: ParticipantState;
   private validator: TurnValidator;
   private topic: string | null = null;
+  private roster: RosterEntry[] | null = null;
 
   constructor(opts: ParticipantOptions) {
     this.opts = opts;
@@ -137,6 +144,7 @@ export class ParticipantRuntime {
     // deterministic participant order — the rule is symmetric
     this.validator = new TurnValidator([opts.agentId, opts.peerId].sort() as [string, string]);
     this.state = this.load();
+    this.roster = this.state.roster;
     this.restoreValidator();
   }
 
@@ -149,6 +157,7 @@ export class ParticipantRuntime {
         own: j.own ?? [],
         transcript: j.transcript ?? [],
         firstSpeaker: j.firstSpeaker ?? null,
+        roster: j.roster ?? null,
         expected: j.expected ?? null,
         lastAcceptedSeq: j.lastAcceptedSeq ?? null,
         pendingPeerSeq: j.pendingPeerSeq ?? null,
@@ -163,6 +172,7 @@ export class ParticipantRuntime {
         own: [],
         transcript: [],
         firstSpeaker: null,
+        roster: null,
         expected: null,
         lastAcceptedSeq: null,
         pendingPeerSeq: null,
@@ -240,6 +250,11 @@ export class ParticipantRuntime {
         if (v.kind === "started") {
           s.firstSpeaker = v.firstSpeaker;
           this.topic = payload.topic ?? null;
+          // Presentation-only; absent on pre-roster controls and tolerated.
+          if (payload.roster && payload.roster.length > 0) {
+            this.roster = payload.roster;
+            s.roster = payload.roster;
+          }
         } else if (v.kind === "ended") {
           s.ended = { reason: v.reason, seq: m.seq };
           s.pendingPeerSeq = null;
@@ -354,6 +369,8 @@ export class ParticipantRuntime {
     const out = await this.opts.onTurn({
       agentId: this.opts.agentId,
       peerId: this.opts.peerId,
+      roster: this.roster ?? undefined,
+      peerDisplayName: this.roster?.find((r) => r.id === this.opts.peerId)?.display_name,
       channel: this.opts.channel,
       topic: this.topic,
       transcript: s.transcript.slice(),

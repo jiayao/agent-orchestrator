@@ -9,7 +9,7 @@
 // Only accepted turns drive budgets, history, and end reasons — everything
 // else stays raw-only.
 
-import type { ChatSignal, TeamEvent } from "../types.ts";
+import type { ChatSignal, RosterEntry, TeamEvent } from "../types.ts";
 import { isChatSignal } from "../chat.ts";
 
 export interface TurnPayload {
@@ -27,6 +27,8 @@ export interface ControlPayload {
   control: "chat_started" | "chat_ended";
   first_speaker?: string; // chat_started
   topic?: string; // chat_started
+  /** presentation-only name roster; ids remain the authoritative identity */
+  roster?: RosterEntry[]; // chat_started
   reason?: string; // chat_ended
   terminal_seq?: number; // chat_ended
 }
@@ -68,11 +70,18 @@ export function encodeTurn(inReplyTo: number | null, body: string, signal?: Chat
   return JSON.stringify(p);
 }
 
-export function encodeStarted(firstSpeaker: string, topic: string): string {
+export function encodeStarted(
+  firstSpeaker: string,
+  topic: string,
+  roster?: RosterEntry[]
+): string {
   const p: ControlPayload = {
     v: 1, type: "control", control: "chat_started",
     first_speaker: firstSpeaker, topic,
   };
+  // Omit entirely when empty so the wire shape is unchanged for callers that
+  // have no names to publish.
+  if (roster && roster.length > 0) p.roster = roster;
   return JSON.stringify(p);
 }
 
@@ -119,6 +128,26 @@ export function decodePayload(text: string): BusPayload | null {
     if (o.topic !== undefined) {
       if (typeof o.topic !== "string") return null;
       p.topic = o.topic;
+    }
+    if (o.roster !== undefined) {
+      // Display labels must degrade gracefully: a malformed roster entry is
+      // dropped, never fatal. Returning null here would discard the whole
+      // chat_started control (decode errors become bad_shape -> ignored),
+      // which would wedge a channel over cosmetics.
+      if (Array.isArray(o.roster)) {
+        const roster: RosterEntry[] = [];
+        for (const raw of o.roster) {
+          if (raw === null || typeof raw !== "object" || Array.isArray(raw)) continue;
+          const e = raw as Record<string, unknown>;
+          if (typeof e.id !== "string" || e.id === "") continue;
+          const entry: RosterEntry = { id: e.id };
+          if (typeof e.display_name === "string" && e.display_name !== "") {
+            entry.display_name = e.display_name;
+          }
+          roster.push(entry);
+        }
+        if (roster.length > 0) p.roster = roster;
+      }
     }
     if (o.reason !== undefined) {
       if (typeof o.reason !== "string") return null;

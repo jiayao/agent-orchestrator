@@ -18,7 +18,7 @@
 // relay + participant dedupe make the replay harmless.
 
 import type { Blackboard } from "../blackboard.ts";
-import type { TaskMeta, TeamConfig, TeamEvent, ChatEndReason } from "../types.ts";
+import type { TaskMeta, TeamConfig, TeamEvent, ChatEndReason, RosterEntry } from "../types.ts";
 import type { BusClient } from "./client.ts";
 import { BusError } from "./client.ts";
 import { hashPayload } from "./crypto.ts";
@@ -43,6 +43,9 @@ export interface BusChatContext {
   agents: [string, string];
   firstSpeaker: string;
   topic: string;
+  /** presentation-only labels published on the opening control. Entry ids are
+   *  restricted to the channel participants; this never affects validation. */
+  roster?: RosterEntry[];
 }
 
 export interface BusAuditorOptions {
@@ -147,12 +150,12 @@ export async function runBusAuditor(
   const openMsgId = committedStart?.bus?.msg_id ?? openingMsgId(ctx.epoch);
   const publishOpening = async () => {
     await client
-      .publish(openMsgId, encodeStarted(ctx.firstSpeaker, ctx.topic))
+      .publish(openMsgId, encodeStarted(ctx.firstSpeaker, ctx.topic, ctx.roster))
       .catch(() => {});
   };
   let lastOpenPublish = 0;
   if (!committedStart) {
-    await publishWithRetry(openMsgId, encodeStarted(ctx.firstSpeaker, ctx.topic));
+    await publishWithRetry(openMsgId, encodeStarted(ctx.firstSpeaker, ctx.topic, ctx.roster));
     lastOpenPublish = Date.now();
   } else {
     // Committed opening: re-publish its deterministic msg_id — relay dedupe
@@ -312,6 +315,8 @@ export async function runBusAuditor(
             author: "orchestrator",
             control: "chat_started",
             first_speaker: v.firstSpeaker,
+            // record what the wire actually carried, not what we would have sent
+            ...(payload.roster ? { roster: payload.roster } : {}),
           },
         });
       }
