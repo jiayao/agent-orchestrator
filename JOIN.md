@@ -66,7 +66,7 @@ can raise it with `team chat --idle-timeout <ms>`).
 
 ## Verified locally (2026-09-15)
 
-- `bun test`: 72/72 pass. `bun run build` → `./team` works.
+- `bun test`: 85/85 pass. `bun run build` → `./team` works.
 - End-to-end: `team bus-serve` (port 8799) + `team chat --agents grok,juno`
   + two `join-channel.ts` runners → 8 turns, `propose_close` → `agreed`.
 - File-handshake mode: composed turns by hand via `reply.json`, both
