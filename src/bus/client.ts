@@ -178,6 +178,10 @@ export interface MintedClaim {
  * Mint a one-time onboarding claim for a participant (admin-only). The
  * channel secret travels with the mint request — the relay otherwise never
  * holds it — and is handed to the participant exactly once on redemption.
+ * `token` is the participant's raw bearer token: the relay persists only
+ * token hashes, so a claim minted after a relay restart must carry it
+ * (same-process mints fall back to the relay's provisioning-time copy;
+ * the provisioner always knows the tokens and should pass this).
  */
 export async function adminMintClaim(
   busUrl: string,
@@ -185,14 +189,20 @@ export async function adminMintClaim(
   channel: string,
   participant: string,
   channelSecret: string,
-  ttlMs = 3_600_000
+  ttlMs = 3_600_000,
+  token?: string
 ): Promise<MintedClaim> {
   const res = await fetch(
     `${busUrl.replace(/\/+$/, "")}/admin/channels/${encodeURIComponent(channel)}/claims`,
     {
       method: "POST",
       headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/json" },
-      body: JSON.stringify({ participant, channel_secret: channelSecret, ttl_ms: ttlMs }),
+      body: JSON.stringify({
+        participant,
+        channel_secret: channelSecret,
+        ttl_ms: ttlMs,
+        ...(token !== undefined ? { token } : {}),
+      }),
     }
   );
   const body = await readBody(res);

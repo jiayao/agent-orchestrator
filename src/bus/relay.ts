@@ -22,11 +22,19 @@
 // - Authorship: one bearer token per participant, minted at provisioning;
 //   `author` is attested as observed on the authenticated POST.
 //
-// State is in-memory: a relay crash loses channels, tokens, dedupe state and
-// the log. Senders re-publish the same msg_id; the auditor re-publishes its
-// deterministic terminal control. Restart = a fresh channel provisioning.
+// State: by default everything is in-memory (dev mode) — a relay crash loses
+// channels, tokens, dedupe state and the log, and restart = a fresh channel
+// provisioning. With `team bus-serve --data-dir <dir>` the recoverable state
+// is durable (see store.ts): channels, SHA-256 token hashes, and the
+// per-channel message log reload on boot, so a restart looks like a
+// transient disconnect — participants resume from their cursor against the
+// intact log. Still deliberately transient: unredeemed claims die on
+// restart, long-poll waiters are dropped, and the auditor lease always
+// boots unheld so a fresh auditor can acquire (a stale auditor process
+// elsewhere is an operator error, same as today).
 
 import { createHash, randomBytes } from "node:crypto";
+import { RelayStore } from "./store.ts";
 
 const CHANNEL_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const MAX_POST_BYTES = 64 * 1024;
@@ -55,14 +63,20 @@ export interface RelayClaim {
 export interface RelayChannel {
   id: string;
   epoch: string;
-  /** token -> author */
+  created_at: string;
+  /** sha256(token) hex -> author — raw tokens are never persisted */
   tokens: Map<string, string>;
-  /** author holding the auditor lease, or null */
+  /** author -> raw token, in-memory only: populated at provisioning so a
+   *  claim mint can hand the participant its token; empty after a restart
+   *  (the mint endpoint then requires "token" in the request body) */
+  rawTokens: Map<string, string>;
+  /** author holding the auditor lease, or null — never persisted as held */
   auditor: string | null;
   messages: RelayStoredMessage[];
   msgIndex: Map<string, RelayStoredMessage>;
   waiters: Set<() => void>;
-  /** one-time onboarding claims, id -> claim; burned on redeem, pruned on expiry */
+  /** one-time onboarding claims, id -> claim; burned on redeem, pruned on
+   *  expiry, never persisted — unredeemed claims die on restart */
   claims: Map<string, RelayClaim>;
 }
 
@@ -88,16 +102,46 @@ function bearer(req: Request): string | null {
   return m ? m[1].trim() : null;
 }
 
-export function startRelay(opts: { port?: number; adminToken: string }): RelayHandle {
+/** Full SHA-256 of a bearer token — the durable identity of a credential. */
+function tokenHash(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+export function startRelay(opts: {
+  port?: number;
+  adminToken: string;
+  /** directory for the durable SQLite store; absent = in-memory (dev) */
+  dataDir?: string;
+}): RelayHandle {
   const channels = new Map<string, RelayChannel>();
   const adminToken = opts.adminToken;
+  const store = opts.dataDir ? new RelayStore(opts.dataDir) : null;
+
+  // Durable boot: rebuild every channel from the store. Transient state is
+  // reconstructed empty — no lease holder (a fresh auditor acquires), no
+  // claims, no waiters, no raw tokens.
+  for (const p of store?.loadChannels() ?? []) {
+    const ch: RelayChannel = {
+      id: p.id,
+      epoch: p.epoch,
+      created_at: p.created_at,
+      tokens: p.tokens,
+      rawTokens: new Map(),
+      auditor: null,
+      messages: p.messages,
+      msgIndex: new Map(p.messages.map((m) => [m.msg_id, m])),
+      waiters: new Set(),
+      claims: new Map(),
+    };
+    channels.set(ch.id, ch);
+  }
 
   const isAdmin = (req: Request) => bearer(req) === adminToken;
 
   const authAuthor = (req: Request, ch: RelayChannel): string | null => {
     const tok = bearer(req);
     if (!tok) return null;
-    return ch.tokens.get(tok) ?? null;
+    return ch.tokens.get(tokenHash(tok)) ?? null;
   };
 
   const append = (ch: RelayChannel, msg_id: string, author: string, nonce: string, ct: string) => {
@@ -109,6 +153,9 @@ export function startRelay(opts: { port?: number; adminToken: string }): RelayHa
       nonce,
       ct,
     };
+    // commit to the store first: a failed write must not produce a seq the
+    // log claims is committed — the client retries and lands a clean append
+    store?.appendMessage(ch.id, msg);
     ch.messages.push(msg);
     ch.msgIndex.set(msg_id, msg);
     for (const w of ch.waiters) w();
@@ -147,21 +194,30 @@ export function startRelay(opts: { port?: number; adminToken: string }): RelayHa
           return json({ error: "tokens must be an object {author: token}" }, 400);
         }
         const tokens = new Map<string, string>();
+        const rawTokens = new Map<string, string>();
         for (const [author, tok] of Object.entries(tokensRaw as Record<string, unknown>)) {
           if (typeof tok !== "string" || !tok) {
             return json({ error: `token for ${author} must be a non-empty string` }, 400);
           }
-          if (tokens.has(tok)) return json({ error: `duplicate token value` }, 400);
-          tokens.set(tok, author);
+          const hash = tokenHash(tok);
+          if (tokens.has(hash)) return json({ error: `duplicate token value` }, 400);
+          tokens.set(hash, author);
+          rawTokens.set(author, tok);
         }
         if (![...tokens.values()].includes("orchestrator")) {
           return json({ error: "tokens must include an \"orchestrator\" author" }, 400);
         }
         const epoch = typeof body.epoch === "string" && body.epoch ? body.epoch : "e0";
+        const createdAt = new Date().toISOString();
+        // durable commit before the channel goes live — a failed write must
+        // not produce a channel the relay will lose on restart
+        store?.createChannel(channel, epoch, createdAt, tokens);
         channels.set(channel, {
           id: channel,
           epoch,
+          created_at: createdAt,
           tokens,
+          rawTokens,
           auditor: null,
           messages: [],
           msgIndex: new Map(),
@@ -177,15 +233,16 @@ export function startRelay(opts: { port?: number; adminToken: string }): RelayHa
         const ch = channels.get(adminTokMatch[1]);
         if (!ch) return json({ error: "no such channel" }, 404);
         const author = decodeURIComponent(adminTokMatch[2]);
-        let removed = false;
-        for (const [tok, a] of ch.tokens) {
-          if (a === author) {
-            ch.tokens.delete(tok);
-            removed = true;
-          }
+        if (![...ch.tokens.values()].includes(author)) {
+          return json({ error: "no such author" }, 404);
         }
+        store?.deleteAuthorTokens(ch.id, author);
+        for (const [hash, a] of ch.tokens) {
+          if (a === author) ch.tokens.delete(hash);
+        }
+        ch.rawTokens.delete(author);
         if (ch.auditor === author) ch.auditor = null;
-        return removed ? json({ ok: true, revoked: author }) : json({ error: "no such author" }, 404);
+        return json({ ok: true, revoked: author });
       }
 
       // ---- one-time onboarding claims ----
@@ -194,6 +251,9 @@ export function startRelay(opts: { port?: number; adminToken: string }): RelayHa
       // unguessable claim id is the credential, single-use, TTL-bounded.
       // The operator pastes only the claim URL into chat with the remote
       // participant — never the long-lived token or channel secret.
+      // Claims are in-memory only: an unredeemed claim dies on restart.
+      // Minting needs the participant's raw token — after a restart it must
+      // come in the request body ("token"), since only hashes persist.
       const claimMintMatch = /^\/admin\/channels\/([A-Za-z0-9_-]{1,128})\/claims$/.exec(path);
       if (claimMintMatch && method === "POST") {
         if (!isAdmin(req)) return json({ error: "unauthorized" }, 401);
@@ -207,14 +267,30 @@ export function startRelay(opts: { port?: number; adminToken: string }): RelayHa
         }
         const participant = typeof body.participant === "string" ? body.participant : "";
         const secret = typeof body.channel_secret === "string" ? body.channel_secret : "";
-        let token: string | null = null;
-        for (const [tok, author] of ch.tokens) {
-          if (author === participant) {
-            token = tok;
-            break;
+        // The claim hands the participant its raw bearer token — but the
+        // durable store keeps only token hashes, so after a restart the raw
+        // token must travel with the mint request ("token" field; the
+        // provisioner knows it). Same-process mints fall back to the
+        // provisioning-time in-memory copy. Either way the token's hash must
+        // check out against the channel's registered hashes.
+        const presented = typeof body.token === "string" && body.token ? body.token : null;
+        const token = presented ?? ch.rawTokens.get(participant) ?? null;
+        if (!token) {
+          if (![...ch.tokens.values()].includes(participant)) {
+            return json({ error: "no such participant" }, 400);
           }
+          return json(
+            {
+              error:
+                "participant token unavailable — raw tokens are not persisted; " +
+                'resubmit with the participant\'s "token" in the request body',
+            },
+            400
+          );
         }
-        if (!token) return json({ error: "no such participant" }, 400);
+        if (ch.tokens.get(tokenHash(token)) !== participant) {
+          return json({ error: "token does not match participant" }, 400);
+        }
         if (!secret) return json({ error: "channel_secret is required" }, 400);
         const ttlMs = Math.min(
           24 * 3_600_000,
@@ -355,7 +431,10 @@ export function startRelay(opts: { port?: number; adminToken: string }): RelayHa
     port,
     url: `http://127.0.0.1:${port}`,
     adminToken,
-    stop: () => server.stop(true),
+    stop: () => {
+      server.stop(true);
+      store?.close();
+    },
     channel: (id) => channels.get(id),
   };
 }

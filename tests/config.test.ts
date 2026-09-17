@@ -38,7 +38,9 @@ describe("config validation", () => {
     expect(cfg.budgets.max_wall_time_ms).toBe(600_000);
     expect(cfg.budgets.max_estimated_cost_usd).toBe(5.0);
     expect(cfg.agents).toHaveLength(1);
-    expect(cfg.agents[0].command.stdin).toBe("prompt");
+    // MINIMAL declares [agents.command], so command is present on the parsed
+    // agent (the field is optional only for console/bus kinds)
+    expect(cfg.agents[0].command!.stdin).toBe("prompt");
     expect(cfg.root).toBe("/fake");
   });
 

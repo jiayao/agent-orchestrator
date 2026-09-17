@@ -110,7 +110,8 @@ export async function provisionBusChat(
       channel,
       agent.id,
       secret,
-      opts.claimTtlMs ?? 3_600_000
+      opts.claimTtlMs ?? 3_600_000,
+      tokens[agent.id]
     );
     claims[agent.id] = {
       claim_id: minted.claim_id,

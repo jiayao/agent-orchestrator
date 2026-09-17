@@ -61,11 +61,40 @@ Relay endpoints (bearer auth; `POST /admin/*` takes the admin token):
 
 - `POST /admin/channels` — provision `{channel, epoch, tokens: {author: token}}`; requires an `orchestrator` author.
 - `DELETE /admin/channels/<channel>/tokens/<author>` — revoke a participant.
-- `POST /admin/channels/<channel>/claims` — mint a single-use onboarding claim `{participant, channel_secret, ttl_ms?}` (admin-only; the relay holds the secret in memory only until redeem/expiry).
+- `POST /admin/channels/<channel>/claims` — mint a single-use onboarding claim `{participant, channel_secret, ttl_ms?, token?}` (admin-only; the relay holds the secret in memory only until redeem/expiry). `token` is the participant's raw bearer token — required only when minting after a relay restart (the relay persists token *hashes*, not raw tokens, so it can no longer re-derive them; the provisioner always knows them).
 - `GET /c/<channel>/claim/<id>` — redeem a claim once: returns `{participant, participants, peers, token, channel_secret, channel, epoch}`, then the claim is dead (second fetch 410, expired 410). `peers` is provisioning's attestation of the peer id — `team join --from-claim-url` persists the bundle to `bus.credentials.json` (0600), and the participant runtime aborts loudly if a wire turn arrives authored by anyone else.
 - `POST /c/<channel>/messages` — publish; a retried `msg_id` returns the original `seq` (`deduped: true`) and never appends twice.
 - `GET /c/<channel>/messages?since=<seq>&wait=<ms>` — long-poll; returns `{messages, latest}`.
 - `POST /c/<channel>/auditor` — take the auditor lease; one per channel, a second author gets 409.
+
+## Relay durability and the Fly deployment
+
+`team bus-serve --data-dir <dir>` makes the relay durable: channels,
+SHA-256 token hashes (never raw tokens), and the per-channel message log
+live in a single SQLite file (`<dir>/relay.sqlite`, WAL mode,
+`synchronous=FULL`). A restart or redeploy then looks like a transient
+disconnect — a participant's next poll resumes from its cursor against the
+intact log instead of 404ing, and a restarted auditor re-acquires its lease
+(boot always starts unheld) and resumes from its own committed cursor.
+
+Deliberately *not* persisted: unredeemed one-time claims die on restart
+(re-mint them — mints after a restart take the participant's `token` in the
+request body), in-flight long-poll waiters drop (clients reconnect), and
+the auditor lease always starts unheld — the single-auditor discipline is
+unchanged, so a stale auditor process elsewhere holding a stale lease
+belief is an operator error, same as today.
+
+The Dockerfile's default command already serves with `--data-dir /data` and
+`fly.toml` mounts a volume at `/data`. One-time operator step:
+
+```sh
+fly volumes create relay_data --region lax --size 1
+fly scale count 1   # still required — one writer owns each channel log
+fly deploy
+```
+
+Keep it to one machine: SQLite makes the log durable, not multi-writer —
+two machines on separate volumes are still two separate logs (a fork).
 
 ## Configure a bus agent
 
@@ -159,7 +188,7 @@ for omp (its ~110s practical ceiling) — see `examples/team.toml`.
 - `team arbitrate <task-id>` — interactive pick, or non-interactive `--accept <event-id>` / `--reject <event-id>` / `--merge <id1,id2>` / `--defer`, with optional `--rationale "..."`
 - `team verdict <task-id> good|bad|mixed [note]` — record the realized outcome to the task + taste log
 - `team chat --agents a,b --topic "..."` — pairwise dialogue; `--resume <task-id>` re-prompts the last committed actor. With `kind = "bus"` agents it provisions a relay channel and starts the auditor instead
-- `team bus-serve [--port 8787]` — local in-memory message-bus relay for development
+- `team bus-serve [--port 8787] [--data-dir dir]` — the message-bus relay. With no `--data-dir` it is in-memory (development); with `--data-dir` channels, token hashes, and the message log persist to `<dir>/relay.sqlite` and survive restarts (the Fly deployment runs this way)
 - `team join --from-claim-url <url> [--state-dir dir]` — redeem a one-time claim URL; persists `bus.credentials.json` (0600) with the token, channel secret, and the provisioned peer id
 - `team export <task-id> [--out path]` — deterministic JSON bundle: inputs, events, decisions, run metrics
 

@@ -1,13 +1,17 @@
 app = "agent-bus-relay"
 primary_region = "lax"
 
-# The relay is in-memory: one machine only (two machines = two separate
-# channel logs = a fork; Fly's proxy round-robins between them). After
-# `fly launch` (which creates two machines by default), run:
+# The relay is durable (SQLite under /data on the mounted volume), but it is
+# still a single-writer system: one machine owns every channel log — two
+# machines = two separate channel logs = a fork (Fly's proxy round-robins
+# between them). After `fly launch` (which creates two machines by default),
+# run:
 #     fly scale count 1
 # max_machines_running pins that invariant in config so a stray scale-up
-# cannot fork the log. Autostop is off: a stop wipes every channel, token,
-# and message; chats must then be re-provisioned.
+# cannot fork the log. Autostop is off so participants aren't dropped
+# mid-chat; a restart now reloads channels, token hashes, and the message
+# log from /data. The volume is a one-time operator step:
+#     fly volumes create relay_data --region lax --size 1
 [http_service]
   internal_port = 8787
   force_https = true
@@ -18,3 +22,7 @@ primary_region = "lax"
 
 [[vm]]
   size = "shared-cpu-1x"
+
+[mounts]
+  source = "relay_data"
+  destination = "/data"

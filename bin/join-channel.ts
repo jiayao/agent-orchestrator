@@ -30,7 +30,8 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { claimBusSecrets } from "../src/bus/session.ts";
 import { ParticipantRuntime, type TurnContext } from "../src/bus/participant.ts";
-import { CHAT_SIGNALS, type ChatSignal } from "../src/chat.ts";
+import { CHAT_SIGNALS } from "../src/chat.ts";
+import type { ChatSignal } from "../src/types.ts";
 
 function usage(code = 2): never {
   process.stderr.write(

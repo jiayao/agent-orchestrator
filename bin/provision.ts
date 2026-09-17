@@ -76,12 +76,12 @@ meta.chat = {
 bb.initTask(meta, topic);
 
 const ttlMs = Number(flags.get("ttl-ms") ?? "3600000");
-const prov = await provisionBusChat(busUrl, adminToken, [picked[0], picked[1]], { claimTtlMs: ttlMs });
+const prov = await provisionBusChat(busUrl, adminToken, [picked[0], picked[1]] as [AgentConfig, AgentConfig], { claimTtlMs: ttlMs });
 meta.chat.bus = {
   bus_url: prov.busUrl,
   channel: prov.channel,
   epoch: prov.epoch,
-  participants: picked.map((a) => a.id),
+  participants: [picked[0].id, picked[1].id] as [string, string],
   first_speaker: prov.firstSpeaker,
   // the auditor publishes this on chat_started; without it the roster never
   // reaches the wire on the provision.ts path (the CLI path sets it itself)

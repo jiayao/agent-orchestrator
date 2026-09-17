@@ -88,8 +88,10 @@ commands:
       connection instructions, starts the auditor
       [--idle-timeout ms] [--claim-ttl-ms ms] [--bus-admin-token T | env TEAM_BUS_ADMIN_TOKEN]
   chat --resume <task-id>             continue a cancelled/interrupted chat
-  bus-serve [--port 8787]             local dev relay (in-memory; prod = Fly)
-      [--admin-token T | env TEAM_BUS_ADMIN_TOKEN]
+  bus-serve [--port 8787]             message-bus relay. With no --data-dir it
+      [--admin-token T | env          is in-memory (dev); --data-dir <dir>
+       TEAM_BUS_ADMIN_TOKEN]          makes channels/tokens/log durable via a
+      [--data-dir dir]                SQLite store (the Fly deployment uses it)
   join --from-claim-url <url>         redeem a one-time bus claim URL into
       [--state-dir dir]               bus.credentials.json (0600): token,
                                       channel secret, and the provisioned
@@ -355,9 +357,12 @@ async function cmdTasks(args: ParsedArgs): Promise<void> {
 }
 
 /**
- * `team bus-serve` — local dev relay. In-memory: a restart loses channels,
- * tokens, dedupe state, and the log (the reference deployment is a persistent
- * relay on Fly). The admin token guards provisioning; with no flag/env a
+ * `team bus-serve` — the message-bus relay. In-memory by default (dev): a
+ * restart loses channels, tokens, dedupe state, and the log. `--data-dir`
+ * makes it durable (SQLite under that dir) — the reference deployment on
+ * Fly runs this way, and a restart then looks like a transient disconnect:
+ * channels, token hashes, and the log reload; participants resume from
+ * their cursors. The admin token guards provisioning; with no flag/env a
  * random one is minted and printed once — the operator's terminal is the
  * trusted provisioning channel.
  */
@@ -369,11 +374,17 @@ async function cmdBusServe(args: ParsedArgs): Promise<void> {
     (typeof flagTok === "string" ? flagTok : undefined) ??
     process.env.TEAM_BUS_ADMIN_TOKEN ??
     newToken();
-  const relay = startRelay({ port, adminToken });
+  const dirFlag = args.flags.get("data-dir");
+  if (dirFlag === true) fail("usage: team bus-serve [--port N] [--data-dir <dir>]", 2);
+  const dataDir = typeof dirFlag === "string" && dirFlag ? resolve(dirFlag) : undefined;
+  const relay = startRelay({ port, adminToken, dataDir });
   if (args.json) {
-    printJson({ ok: true, url: relay.url, port: relay.port, admin_token: adminToken });
+    printJson({ ok: true, url: relay.url, port: relay.port, admin_token: adminToken, data_dir: dataDir ?? null });
   } else {
-    log(`bus relay listening on ${relay.url} (in-memory, dev only)`);
+    log(
+      `bus relay listening on ${relay.url} ` +
+        (dataDir ? `(durable store: ${join(dataDir, "relay.sqlite")})` : "(in-memory, dev only)")
+    );
     if (generated) {
       log(`admin token: ${adminToken}`);
       log(`export TEAM_BUS_ADMIN_TOKEN=${adminToken}   # for team chat provisioning`);
