@@ -40,12 +40,24 @@ export interface RelayStoredMessageRow {
   ct: string;
 }
 
+export interface PersistedSeat {
+  seat_id: string;
+  display_name?: string;
+  role?: string;
+  /** "claimed" while a live token is bound to the seat; "vacant" after a
+   *  revoke. Vacancy is a property of the SEAT, not the token — the seat_id
+   *  survives revocation so a later join can reclaim it. */
+  state: "claimed" | "vacant";
+}
+
 export interface PersistedChannel {
   id: string;
   epoch: string;
   created_at: string;
   /** sha256(token) hex -> author */
   tokens: Map<string, string>;
+  /** seat_id -> seat record. Outlives token revocation (see vacateSeat). */
+  seats: Map<string, PersistedSeat>;
   messages: RelayStoredMessageRow[];
 }
 
@@ -60,6 +72,14 @@ CREATE TABLE IF NOT EXISTS tokens (
   token_hash TEXT NOT NULL,
   author TEXT NOT NULL,
   PRIMARY KEY (channel_id, token_hash)
+);
+CREATE TABLE IF NOT EXISTS seats (
+  channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+  seat_id TEXT NOT NULL,
+  display_name TEXT,
+  role TEXT,
+  state TEXT NOT NULL DEFAULT 'claimed',
+  PRIMARY KEY (channel_id, seat_id)
 );
 CREATE TABLE IF NOT EXISTS messages (
   channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
@@ -88,12 +108,13 @@ export class RelayStore {
     this.db.exec(SCHEMA);
   }
 
-  /** Provision a channel row plus its token-hash rows, atomically. */
+  /** Provision a channel row plus its token-hash and seat rows, atomically. */
   createChannel(
     id: string,
     epoch: string,
     createdAt: string,
-    tokens: Iterable<readonly [string, string]>
+    tokens: Iterable<readonly [string, string]>,
+    seats: Iterable<{ seat_id: string; display_name?: string; role?: string }> = []
   ): void {
     const tx = this.db.transaction(() => {
       this.db
@@ -103,6 +124,11 @@ export class RelayStore {
         "INSERT INTO tokens (channel_id, token_hash, author) VALUES (?, ?, ?)"
       );
       for (const [hash, author] of tokens) ins.run(id, hash, author);
+      const insSeat = this.db.prepare(
+        "INSERT INTO seats (channel_id, seat_id, display_name, role, state) " +
+          "VALUES (?, ?, ?, ?, 'claimed')"
+      );
+      for (const s of seats) insSeat.run(id, s.seat_id, s.display_name ?? null, s.role ?? null);
     });
     tx();
   }
@@ -141,6 +167,16 @@ export class RelayStore {
       channel_id: string;
     } & RelayStoredMessageRow)[];
 
+    const seatRows = this.db
+      .query("SELECT channel_id, seat_id, display_name, role, state FROM seats")
+      .all() as {
+      channel_id: string;
+      seat_id: string;
+      display_name: string | null;
+      role: string | null;
+      state: string;
+    }[];
+
     const byChannel = new Map<string, PersistedChannel>();
     for (const c of channels) {
       byChannel.set(c.id, {
@@ -148,10 +184,29 @@ export class RelayStore {
         epoch: c.epoch,
         created_at: c.created_at,
         tokens: new Map(),
+        seats: new Map(),
         messages: [],
       });
     }
     for (const t of tokenRows) byChannel.get(t.channel_id)?.tokens.set(t.token_hash, t.author);
+    for (const s of seatRows) {
+      byChannel.get(s.channel_id)?.seats.set(s.seat_id, {
+        seat_id: s.seat_id,
+        ...(s.display_name !== null ? { display_name: s.display_name } : {}),
+        ...(s.role !== null ? { role: s.role } : {}),
+        state: s.state === "vacant" ? "vacant" : "claimed",
+      });
+    }
+    // Migration: a store written before seats existed has no seat rows. Derive
+    // them from live tokens (minus the reserved orchestrator author) so an
+    // upgraded relay does not report an empty seat list for existing channels.
+    for (const c of byChannel.values()) {
+      if (c.seats.size > 0) continue;
+      for (const author of c.tokens.values()) {
+        if (author === "orchestrator") continue;
+        c.seats.set(author, { seat_id: author, state: "claimed" });
+      }
+    }
     for (const m of msgRows) {
       byChannel.get(m.channel_id)?.messages.push({
         seq: m.seq,

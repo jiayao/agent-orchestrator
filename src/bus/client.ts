@@ -140,16 +140,34 @@ export class BusClient {
   }
 }
 
+/** One declared seat: the stable, addressable slot a participant claims. */
+export interface SeatSpec {
+  seat_id: string;
+  display_name?: string;
+  role?: string;
+}
+
 /** Operator admin calls — the provisioning channel is `team chat` itself. */
 export async function adminProvisionChannel(
   busUrl: string,
   adminToken: string,
-  opts: { channel: string; epoch: string; tokens: Record<string, string> }
+  opts: {
+    channel: string;
+    epoch: string;
+    tokens: Record<string, string>;
+    /** optional seat list; the relay derives one seat per token when absent */
+    seats?: SeatSpec[];
+  }
 ): Promise<void> {
   const res = await fetch(`${busUrl.replace(/\/+$/, "")}/admin/channels`, {
     method: "POST",
     headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/json" },
-    body: JSON.stringify({ channel: opts.channel, epoch: opts.epoch, tokens: opts.tokens }),
+    body: JSON.stringify({
+      channel: opts.channel,
+      epoch: opts.epoch,
+      tokens: opts.tokens,
+      ...(opts.seats !== undefined ? { seats: opts.seats } : {}),
+    }),
   });
   const body = await readBody(res);
   if (!res.ok) throw new BusError(`provisioning rejected: ${body.error ?? res.status}`, res.status);
