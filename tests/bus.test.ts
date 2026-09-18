@@ -233,6 +233,27 @@ describe("onboarding claims", () => {
     }
   });
 
+  test("a GET cannot burn a claim; only POST redeems it", async () => {
+    const f = await setupBus("t-claimget");
+    try {
+      const minted = await adminMintClaim(f.relay.url, "adm-test", f.ctx.channel, "a", f.secret);
+      const url = `${f.relay.url}/c/${f.ctx.channel}/claim/${minted.claim_id}`;
+      // a link preview, mail scanner, or prefetcher issues GET and nothing else.
+      // It must be refused without destroying the claim — this is the whole
+      // point of POST redemption.
+      const got = await fetch(url);
+      expect(got.status).toBe(405);
+      // the claim survived the GET: an explicit POST still redeems it
+      const bundle = await fetchClaim(url);
+      expect(bundle.participant).toBe("a");
+      expect(bundle.token).toBe(f.tokens.a);
+      // and only now is it single-use and dead
+      await expect(fetchClaim(url)).rejects.toThrow(/no such claim/);
+    } finally {
+      f.relay.stop();
+    }
+  });
+
   test("expired claim is dead; unknown claim is 404", async () => {
     const f = await setupBus("t-claimexp");
     try {
