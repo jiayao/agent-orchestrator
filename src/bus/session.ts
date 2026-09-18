@@ -25,6 +25,7 @@ import {
   fetchClaim,
   type ClaimBundle,
   type FetchFn,
+  type SeatSpec,
 } from "./client.ts";
 import { newChannelSecret, newId, newToken } from "./crypto.ts";
 import { runBusAuditor, type BusAuditorOptions } from "./auditor.ts";
@@ -88,7 +89,7 @@ export async function provisionBusChat(
   busUrl: string,
   adminToken: string,
   agents: [AgentConfig, AgentConfig],
-  opts: { claimTtlMs?: number } = {}
+  opts: { claimTtlMs?: number; seats?: SeatSpec[] } = {}
 ): Promise<BusProvision> {
   const channel = newId("chat-");
   const epoch = newId("e-");
@@ -98,7 +99,27 @@ export async function provisionBusChat(
     [agents[1].id]: newToken(),
     orchestrator: newToken(),
   };
-  await adminProvisionChannel(busUrl, adminToken, { channel, epoch, tokens });
+  // The seat list declares the channel's addressable slots. Defaults to one
+  // seat per speaking agent (id + label + role), which is today's shape; an
+  // explicit list can declare more seats than speakers, so a channel can
+  // hold open slots for a later join/refill. The chat layer still requires
+  // exactly two SPEAKERS — N>2 turn-taking is a separate design.
+  const seats: SeatSpec[] =
+    opts.seats ??
+    agents.map((a) => ({
+      seat_id: a.id,
+      ...(a.display_name ? { display_name: a.display_name } : {}),
+      role: a.role,
+    }));
+  // Every seat must be backed by a token — the relay refuses a seat with no
+  // credential behind it, so an open seat (declared, not yet occupied) would
+  // otherwise fail provisioning with "seat X has no token". Mint one token per
+  // seat_id. Claims stay bound to the two speaking agents: an open slot is
+  // joined later via a re-mint, not handed out at provision.
+  for (const s of seats) {
+    if (!(s.seat_id in tokens)) tokens[s.seat_id] = newToken();
+  }
+  await adminProvisionChannel(busUrl, adminToken, { channel, epoch, tokens, seats });
   // One-time claim per participant: the operator hands the remote side the
   // claim URL instead of pasting the long-lived token + channel secret into
   // a chat transcript. Local sides keep using bus.secret.json.

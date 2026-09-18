@@ -52,6 +52,12 @@ export interface RelayStoredMessage {
 export interface RelayClaim {
   id: string;
   participant: string;
+  /** the seat this claim populates. Equal to `participant` today, but kept
+   *  separate so a claim can address a seat independently of the redeemer's
+   *  id — the addressing model seats exist to enable. */
+  seat_id?: string;
+  /** true when minting refilled a seat that had been vacated by a revoke */
+  filled_vacant?: boolean;
   token: string;
   /** channel secret, hex — held only until redemption or expiry */
   secret: string;
@@ -78,6 +84,18 @@ export interface RelayChannel {
   /** one-time onboarding claims, id -> claim; burned on redeem, pruned on
    *  expiry, never persisted — unredeemed claims die on restart */
   claims: Map<string, RelayClaim>;
+  /** seat_id -> seat record. A seat is the stable, addressable slot; a
+   *  revoke vacates it (state "vacant") instead of erasing it, so the
+   *  seat_id survives and a later join can reclaim it. */
+  seats: Map<string, RelaySeat>;
+}
+
+export interface RelaySeat {
+  seat_id: string;
+  /** presentation-only label; belongs to the seat record, not the token */
+  display_name?: string;
+  role?: string;
+  state: "claimed" | "vacant";
 }
 
 export interface RelayHandle {
@@ -132,6 +150,7 @@ export function startRelay(opts: {
       msgIndex: new Map(p.messages.map((m) => [m.msg_id, m])),
       waiters: new Set(),
       claims: new Map(),
+      seats: new Map(p.seats),
     };
     channels.set(ch.id, ch);
   }
@@ -209,9 +228,46 @@ export function startRelay(opts: {
         }
         const epoch = typeof body.epoch === "string" && body.epoch ? body.epoch : "e0";
         const createdAt = new Date().toISOString();
+        // Optional seat list. Absent = derive one seat per participant from
+        // the tokens (minus the reserved orchestrator), which keeps every
+        // pre-seat caller working unchanged.
+        const seats = new Map<string, RelaySeat>();
+        const seatsRaw = body.seats;
+        if (seatsRaw !== undefined) {
+          if (!Array.isArray(seatsRaw)) return json({ error: "seats must be an array" }, 400);
+          for (const entry of seatsRaw) {
+            if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+              return json({ error: "each seat must be an object" }, 400);
+            }
+            const s = entry as Record<string, unknown>;
+            const seatId = typeof s.seat_id === "string" ? s.seat_id : "";
+            if (!seatId) return json({ error: "each seat needs a seat_id" }, 400);
+            if (seats.has(seatId)) return json({ error: `duplicate seat ${seatId}` }, 400);
+            seats.set(seatId, {
+              seat_id: seatId,
+              ...(typeof s.display_name === "string" && s.display_name
+                ? { display_name: s.display_name }
+                : {}),
+              ...(typeof s.role === "string" && s.role ? { role: s.role } : {}),
+              state: "claimed",
+            });
+          }
+          // every seat must be backed by a token, or it is neither reachable
+          // nor mintable — catch the mismatch at provision, not at join
+          for (const seatId of seats.keys()) {
+            if (!rawTokens.has(seatId)) {
+              return json({ error: `seat ${seatId} has no token` }, 400);
+            }
+          }
+        } else {
+          for (const author of tokens.values()) {
+            if (author === "orchestrator") continue;
+            seats.set(author, { seat_id: author, state: "claimed" });
+          }
+        }
         // durable commit before the channel goes live — a failed write must
         // not produce a channel the relay will lose on restart
-        store?.createChannel(channel, epoch, createdAt, tokens);
+        store?.createChannel(channel, epoch, createdAt, tokens, [...seats.values()]);
         channels.set(channel, {
           id: channel,
           epoch,
@@ -223,6 +279,7 @@ export function startRelay(opts: {
           msgIndex: new Map(),
           waiters: new Set(),
           claims: new Map(),
+          seats,
         });
         return json({ ok: true, channel, epoch }, 201);
       }
@@ -233,16 +290,23 @@ export function startRelay(opts: {
         const ch = channels.get(adminTokMatch[1]);
         if (!ch) return json({ error: "no such channel" }, 404);
         const author = decodeURIComponent(adminTokMatch[2]);
-        if (![...ch.tokens.values()].includes(author)) {
-          return json({ error: "no such author" }, 404);
+        // A revoke means "this credential is dead", not "this seat never
+        // existed". Vacate the seat: drop the live token(s) but keep the
+        // seat row, so the seat_id (and its label) survives and can be
+        // reclaimed by a later mint. Deleting the row would make the seat
+        // unmintable, which is exactly the refill case seats exist for.
+        const seat = ch.seats.get(author);
+        if (!seat && ![...ch.tokens.values()].includes(author)) {
+          return json({ error: "no such seat" }, 404);
         }
-        store?.deleteAuthorTokens(ch.id, author);
+        store?.vacateSeat(ch.id, author);
         for (const [hash, a] of ch.tokens) {
           if (a === author) ch.tokens.delete(hash);
         }
         ch.rawTokens.delete(author);
+        if (seat) seat.state = "vacant";
         if (ch.auditor === author) ch.auditor = null;
-        return json({ ok: true, revoked: author });
+        return json({ ok: true, revoked: author, seat_state: seat ? "vacant" : "absent" });
       }
 
       // ---- one-time onboarding claims ----
@@ -274,10 +338,27 @@ export function startRelay(opts: {
         // provisioning-time in-memory copy. Either way the token's hash must
         // check out against the channel's registered hashes.
         const presented = typeof body.token === "string" && body.token ? body.token : null;
+        const seat = ch.seats.get(participant);
+        // A vacant seat has NO live token row by design (that is what revoke
+        // left behind), so the "does the hash match" check below would reject
+        // every refill. Rebind instead: a presented raw token claims the
+        // vacant seat and becomes its live credential. This is the whole
+        // point of seats — a refill rides the same raw-token path a
+        // post-restart mint already uses.
+        if (seat && seat.state === "vacant" && !presented) {
+          return json(
+            {
+              error:
+                `seat ${participant} is vacant — resubmit with the seat's "token" ` +
+                "in the request body to rebind it",
+            },
+            400
+          );
+        }
         const token = presented ?? ch.rawTokens.get(participant) ?? null;
         if (!token) {
-          if (![...ch.tokens.values()].includes(participant)) {
-            return json({ error: "no such participant" }, 400);
+          if (!seat && ![...ch.tokens.values()].includes(participant)) {
+            return json({ error: "no such seat" }, 400);
           }
           return json(
             {
@@ -288,7 +369,23 @@ export function startRelay(opts: {
             400
           );
         }
-        if (ch.tokens.get(tokenHash(token)) !== participant) {
+        // remember the pre-rebind state: the redeemer is told this claim
+        // refilled a vacated seat, which is how a re-joining participant
+        // learns it walked into an existing slot rather than a fresh one
+        const filledVacant = !!(seat && seat.state === "vacant");
+        if (seat && seat.state === "vacant") {
+          // rebind a fresh credential to the vacated seat (durable + memory),
+          // so the minted claim hands out a token that actually authenticates
+          const hash = tokenHash(token);
+          const clashing = ch.tokens.get(hash);
+          if (clashing !== undefined && clashing !== participant) {
+            return json({ error: `token already bound to ${clashing}` }, 400);
+          }
+          store?.claimSeat(ch.id, participant, hash);
+          ch.tokens.set(hash, participant);
+          ch.rawTokens.set(participant, token);
+          seat.state = "claimed";
+        } else if (ch.tokens.get(tokenHash(token)) !== participant) {
           return json({ error: "token does not match participant" }, 400);
         }
         if (!secret) return json({ error: "channel_secret is required" }, 400);
@@ -300,6 +397,8 @@ export function startRelay(opts: {
         const claim: RelayClaim = {
           id,
           participant,
+          seat_id: participant,
+          ...(filledVacant ? { filled_vacant: true } : {}),
           token,
           secret,
           epoch: ch.epoch,
@@ -419,6 +518,11 @@ export function startRelay(opts: {
           channel_secret: claim.secret,
           channel: ch.id,
           epoch: claim.epoch,
+          // seat binding: which stable slot this claim populated, so the
+          // redeemer addresses the seat, not a one-off participant name.
+          // seat_state "vacant" means it refilled a revoked seat.
+          seat_id: claim.seat_id ?? claim.participant,
+          seat_state: claim.filled_vacant ? "vacant" : "claimed",
         });
       }
 

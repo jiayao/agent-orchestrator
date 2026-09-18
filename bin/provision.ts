@@ -23,7 +23,14 @@ for (let i = 0; i < argv.length; i++) {
 const configPath = flags.get("config") ?? `${process.cwd()}/team.toml`;
 const topic = flags.get("topic");
 if (!topic) {
-  process.stderr.write('usage: bun bin/provision.ts --config <team.toml> --topic "..." [--agents a,b] [--ttl-ms n]\n');
+  process.stderr.write(
+    'usage: bun bin/provision.ts --config <team.toml> --topic "..." [--agents a,b] [--seats a,b,c] [--ttl-ms n]\n' +
+      "\n" +
+      "--seats declares the channel's addressable slots as an ordered comma list.\n" +
+      "It defaults to one seat per speaking agent. Extra seats declare slots no\n" +
+      "speaker occupies yet, so a later join can claim or refill them. The chat\n" +
+      "still requires exactly two SPEAKERS — N>2 turn-taking is a separate design.\n"
+  );
   process.exit(2);
 }
 const adminToken = process.env.TEAM_BUS_ADMIN_TOKEN;
@@ -43,6 +50,30 @@ const picked = ids.map((id) => {
 if (picked.length !== 2) throw new Error(`need exactly two agents (got ${picked.length})`);
 const busUrl = picked[0].bus_url!;
 if (picked[1].bus_url !== busUrl) throw new Error("both agents must share one bus_url");
+
+// Seat list: default = the two speakers, in order. An explicit --seats may
+// name more slots than there are speakers (open seats for a later join), but
+// every seat must name a configured bus agent, and every speaking agent must
+// hold a seat — otherwise a speaker could not be minted.
+const seatIds = (flags.get("seats") ?? picked.map((a) => a.id).join(","))
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+if (new Set(seatIds).size !== seatIds.length) throw new Error("duplicate seat id in --seats");
+for (const id of picked.map((a) => a.id)) {
+  if (!seatIds.includes(id)) throw new Error(`speaking agent ${id} has no seat`);
+}
+// an extra seat needs an agent entry so its label/role are known
+const seatSpecs = seatIds.map((id) => {
+  const a = config.agents.find((x) => x.id === id);
+  if (!a) throw new Error(`seat ${id} names no agent in the config`);
+  if (a.kind !== "bus") throw new Error(`seat ${id} is kind ${a.kind}, not bus`);
+  return {
+    seat_id: id,
+    ...(a.display_name ? { display_name: a.display_name } : {}),
+    role: a.role,
+  };
+});
 
 mkdirSync(config.root + "/.team", { recursive: true });
 const bb = new Blackboard(`${config.root}/.team`);
@@ -76,7 +107,10 @@ meta.chat = {
 bb.initTask(meta, topic);
 
 const ttlMs = Number(flags.get("ttl-ms") ?? "3600000");
-const prov = await provisionBusChat(busUrl, adminToken, [picked[0], picked[1]] as [AgentConfig, AgentConfig], { claimTtlMs: ttlMs });
+const prov = await provisionBusChat(busUrl, adminToken, [picked[0], picked[1]] as [AgentConfig, AgentConfig], {
+  claimTtlMs: ttlMs,
+  seats: seatSpecs,
+});
 meta.chat.bus = {
   bus_url: prov.busUrl,
   channel: prov.channel,
