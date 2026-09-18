@@ -489,14 +489,28 @@ export function startRelay(opts: {
         return json({ error: `auditor lease held by ${ch.auditor}` }, 409);
       }
 
-      // Claim redemption: unauthenticated, single-use. Burn the claim before
-      // responding so a concurrent double-fetch cannot both succeed.
-      // The response also attests the channel's participant list — the
-      // redeemer learns its peer id from provisioning instead of inferring
-      // it from the first peer turn (participants = token authors minus the
-      // reserved "orchestrator" auditor author).
+      // Claim redemption: unauthenticated, single-use.
+      //
+      // POST, not GET — deliberately. A claim URL is a bearer capability, and
+      // HTTP defines GET as safe/idempotent, so every link preview, mail
+      // scanner, and browser prefetcher issues one without malice and would
+      // burn the claim before its intended redeemer ever saw it. A GET here is
+      // therefore non-destructive: 405 plus a hint, claim left intact. Only an
+      // explicit POST redeems.
+      //
+      // Burn the claim before responding so a concurrent double-redeem cannot
+      // both succeed. The response also attests the channel's participant
+      // list — the redeemer learns its peer id from provisioning instead of
+      // inferring it from the first peer turn (participants = token authors
+      // minus the reserved "orchestrator" auditor author).
       const claimMatch = /^\/c\/([A-Za-z0-9_-]{1,128})\/claim\/([A-Za-z0-9_-]{1,128})$/.exec(path);
       if (claimMatch && method === "GET") {
+        return json(
+          { error: "claims are redeemed with POST; a GET must not burn one" },
+          405
+        );
+      }
+      if (claimMatch && method === "POST") {
         const ch = channels.get(claimMatch[1]);
         if (!ch) return json({ error: "no such channel" }, 404);
         const claim = ch.claims.get(claimMatch[2]);

@@ -260,12 +260,14 @@ const isStringArray = (v: unknown): v is string[] =>
   Array.isArray(v) && v.every((x) => typeof x === "string");
 
 /**
- * Redeem a one-time claim URL. Single-use: a second fetch gets 410, an
- * expired or unknown claim gets 404/410. The caller should persist the
+ * Redeem a one-time claim URL. POST, never GET: the relay refuses a GET so a
+ * link preview or mail scanner cannot burn the claim (a GET is non-destructive
+ * and returns 405). Single-use: a second redeem gets 404 (the claim is gone),
+ * an expired claim gets 410 on its first attempt. The caller should persist the
  * bundle to a 0600 file and never paste it into chat.
  */
 export async function fetchClaim(claimUrl: string): Promise<ClaimBundle> {
-  const res = await fetch(claimUrl);
+  const res = await fetch(claimUrl, { method: "POST" });
   const body = await readBody(res);
   if (!res.ok) throw new BusError(`claim fetch rejected: ${body.error ?? res.status}`, res.status);
   const { participant, participants, peers, token, channel_secret, channel, epoch } = body;

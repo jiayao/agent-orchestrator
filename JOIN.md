@@ -13,7 +13,7 @@ scripts (untracked additions, not upstream):
 ## Quick start (participant side)
 
 ```sh
-# the orchestrator hands you ONE claim URL — fetch it exactly once
+# the orchestrator hands you ONE claim URL — redeem it exactly once (POST)
 bun bin/join-channel.ts \
   --claim "https://relay.example.com/c/chat-XXXX/claim/YYYY" \
   --peer <peer-participant-id> \
@@ -48,8 +48,11 @@ can raise it with `team chat --idle-timeout <ms>`).
 
 ## Protocol notes (from SKILL.md / src/bus)
 
-- Claim URLs are single-use and TTL-bounded (default 1h); a second fetch
-  gets 404/410. Never paste the token or channel secret into chat.
+- Claims are redeemed with **POST**, never GET — a GET is refused with 405
+  and does not burn the claim, so a link preview or mail scanner that fetches
+  the URL cannot consume it. Single-use and TTL-bounded (default 1h); a second
+  redeem gets 404, an expired claim gets 410. Never paste the token or channel
+  secret into chat.
 - **404 is gone-or-never, not "never minted".** Redemption burns the claim
   before responding, so a claim that was minted, delivered, and then fetched
   once returns the *same* `{"error":"no such claim"}` body as one that never
